@@ -803,10 +803,309 @@ static func::FuncOp getMemsetFunc(ModuleOp module, mlir::Type elemType) {
       {fiveDimUnknownSizeMemRefType, int16Type, int16Type, int32Type});
 }
 
+static std::tuple<int64_t, int64_t, int64_t>
+getConv2dBounds(miopen::ConvOpType dir,
+                const miopen::Conv2dGenerator::Config &genConfig) {
+  int64_t dim, dimH, dimW;
+  char channel;
+  std::string layout;
+  SmallVector<int64_t, 5> dimension;
+  switch (dir) {
+  case miopen::ConvOpType::Fwd:
+    channel = 'c';
+    dimension = genConfig.inputDimension;
+    layout = genConfig.inputLayout;
+    break;
+  case miopen::ConvOpType::BwdData:
+    channel = 'k';
+    dimension = genConfig.outputDimension;
+    layout = genConfig.outputLayout;
+    break;
+  case miopen::ConvOpType::BwdWeight:
+    channel = 'n';
+    dimension = genConfig.inputDimension;
+    layout = genConfig.inputLayout;
+    break;
+  }
+  for (const auto &t : llvm::zip(layout, dimension)) {
+    char *c(&std::get<0>(t));
+    if (*c == channel)
+      dim = std::get<1>(t);
+    if (*c == 'h')
+      dimH = std::get<1>(t);
+    if (*c == 'w')
+      dimW = std::get<1>(t);
+  }
+  return std::make_tuple(dim, dimH, dimW);
+}
+
+static void
+createCPUConvWithMLIR(ModuleOp module, Block *block,
+                      const miopen::Conv2dGenerator::Config &genConfig) {
+  OpBuilder b(module.getContext());
+  b.setInsertionPoint(block, block->begin());
+
+  auto loc = b.getUnknownLoc();
+  auto zeroI16Op = b.create<arith::ConstantIntOp>(loc, 0, b.getIntegerType(16));
+  auto zeroI32Op = b.create<arith::ConstantIntOp>(loc, 0, b.getIntegerType(32));
+
+  // Initialize result tensor
+  mlir::BlockArgument resultTensor;
+  switch (genConfig.operation.getValue()) {
+  case miopen::ConvOpType::Fwd:
+    resultTensor = block->getArgument(2);
+    break;
+  case miopen::ConvOpType::BwdData:
+    resultTensor = block->getArgument(1);
+    break;
+  case miopen::ConvOpType::BwdWeight:
+    resultTensor = block->getArgument(0);
+    break;
+  }
+  auto resultType = resultTensor.getType().template dyn_cast<MemRefType>();
+  auto elemType = resultType.getElementType();
+  MemRefType mr5DUnkType = MemRefType::get({-1, -1, -1, -1, -1}, elemType);
+  auto memrefCastOp = b.create<memref::CastOp>(loc, mr5DUnkType, resultTensor);
+  b.create<func::CallOp>(
+      loc, getMemsetFunc(module, elemType),
+      ValueRange{memrefCastOp, zeroI16Op, zeroI16Op, zeroI32Op});
+
+  AffineExpr heightExpr, widthExpr;
+  AffineMap heightMap, widthMap;
+
+  switch (genConfig.operation.getValue()) {
+  case miopen::ConvOpType::Fwd:
+  case miopen::ConvOpType::BwdWeight:
+    heightExpr = b.getAffineDimExpr(0) * genConfig.strideHeight +
+                 b.getAffineDimExpr(1) * genConfig.dilationHeight -
+                 genConfig.paddingHeightLeft;
+    widthExpr = b.getAffineDimExpr(0) * genConfig.strideWidth +
+                b.getAffineDimExpr(1) * genConfig.dilationWidth -
+                genConfig.paddingWidthLeft;
+    break;
+  case miopen::ConvOpType::BwdData:
+    heightExpr = b.getAffineDimExpr(0) + genConfig.paddingHeightLeft -
+                 b.getAffineDimExpr(1) * genConfig.dilationHeight;
+    widthExpr = b.getAffineDimExpr(0) + genConfig.paddingWidthLeft -
+                b.getAffineDimExpr(1) * genConfig.dilationWidth;
+    heightMap = AffineMap::get(2, 0, {heightExpr}, b.getContext());
+    widthMap = AffineMap::get(2, 0, {widthExpr}, b.getContext());
+    break;
+  }
+  heightMap = AffineMap::get(2, 0, {heightExpr}, b.getContext());
+  widthMap = AffineMap::get(2, 0, {widthExpr}, b.getContext());
+
+  SmallVector<int64_t, 8> lowerBounds(8, 0);
+  SmallVector<int64_t, 8> upperBounds;
+  SmallVector<int64_t, 8> steps(8, 1);
+  std::string loopIVs;
+
+  int64_t dimX, dimH, dimW;
+  int64_t out_h, out_w;
+  std::tie(dimX, dimH, dimW) =
+      getConv2dBounds(genConfig.operation.getValue(), genConfig);
+
+  switch (genConfig.operation.getValue()) {
+  case miopen::ConvOpType::Fwd:
+    llvm::copy(genConfig.outputDimension, std::back_inserter(upperBounds));
+    upperBounds.push_back(dimX);
+    upperBounds.push_back(genConfig.filterHeight);
+    upperBounds.push_back(genConfig.filterWidth);
+    loopIVs.append(genConfig.outputLayout);
+    loopIVs.append("cyx");
+    break;
+  case miopen::ConvOpType::BwdData:
+    llvm::copy(genConfig.inputDimension, std::back_inserter(upperBounds));
+    upperBounds.push_back(dimX);
+    upperBounds.push_back(genConfig.filterHeight);
+    upperBounds.push_back(genConfig.filterWidth);
+    loopIVs.append(genConfig.inputLayout);
+    loopIVs.append("kyx");
+    break;
+  case miopen::ConvOpType::BwdWeight:
+    std::tie(std::ignore, out_h, out_w) =
+        getConv2dBounds(miopen::ConvOpType::BwdData, genConfig);
+    llvm::copy(genConfig.filterDimension, std::back_inserter(upperBounds));
+    upperBounds.push_back(dimX);
+    upperBounds.push_back(out_h);
+    upperBounds.push_back(out_w);
+    loopIVs.append(genConfig.filterLayout);
+    loopIVs.append("nhw");
+    break;
+  }
+
+  auto createConv2dLoopNest = [elemType, heightMap, widthMap, dimH, dimW, block,
+                               loopIVs, &genConfig](OpBuilder b, Location loc,
+                                                    ValueRange ivs) {
+    auto strideHeight =
+        b.create<arith::ConstantIndexOp>(loc, genConfig.strideHeight);
+    auto strideWidth =
+        b.create<arith::ConstantIndexOp>(loc, genConfig.strideWidth);
+    mlir::Value heightIdx, widthIdx;
+    mlir::Value heightTempIdx, widthTempIdx;
+
+    switch (genConfig.operation.getValue()) {
+    case miopen::ConvOpType::Fwd:
+      heightIdx = b.create<AffineApplyOp>(
+          loc, heightMap,
+          ValueRange{ivs[genConfig.outputLayout.find('h')], ivs[6]});
+      widthIdx = b.create<AffineApplyOp>(
+          loc, widthMap,
+          ValueRange{ivs[genConfig.outputLayout.find('w')], ivs[7]});
+      break;
+    case miopen::ConvOpType::BwdData:
+      heightTempIdx = b.create<AffineApplyOp>(
+          loc, heightMap,
+          ValueRange{ivs[genConfig.inputLayout.find('h')], ivs[6]});
+      widthTempIdx = b.create<AffineApplyOp>(
+          loc, widthMap,
+          ValueRange{ivs[genConfig.inputLayout.find('w')], ivs[7]});
+      heightIdx =
+          b.create<arith::FloorDivSIOp>(loc, heightTempIdx, strideHeight);
+      widthIdx = b.create<arith::FloorDivSIOp>(loc, widthTempIdx, strideWidth);
+      break;
+    case miopen::ConvOpType::BwdWeight:
+      heightIdx = b.create<AffineApplyOp>(
+          loc, heightMap,
+          ValueRange{ivs[6], ivs[genConfig.filterLayout.find('y')]});
+      widthIdx = b.create<AffineApplyOp>(
+          loc, widthMap,
+          ValueRange{ivs[7], ivs[genConfig.filterLayout.find('x')]});
+      break;
+    }
+
+    auto getIndices = [&](std::string tensor) {
+      SmallVector<mlir::Value, 5> result;
+      std::string layout;
+      if (tensor == "filter")
+        layout = genConfig.filterLayout;
+      else if (tensor == "input")
+        layout = genConfig.inputLayout;
+      else
+        layout = genConfig.outputLayout;
+      for (auto c : layout) {
+        auto direction = genConfig.operation.getValue();
+        if ((direction == miopen::ConvOpType::Fwd ||
+             direction == miopen::ConvOpType::BwdWeight) &&
+            tensor == "input") {
+          if (c == 'h') {
+            result.push_back(heightIdx);
+            continue;
+          } else if (c == 'w') {
+            result.push_back(widthIdx);
+            continue;
+          }
+        } else if (direction == miopen::ConvOpType::BwdData &&
+                   tensor == "output") {
+          if (c == 'h') {
+            result.push_back(heightIdx);
+            continue;
+          } else if (c == 'w') {
+            result.push_back(widthIdx);
+            continue;
+          }
+        }
+        result.push_back(ivs[loopIVs.find(c)]);
+      }
+      return result;
+    };
+
+    // Generate boundary testing
+    auto zeroIdx = b.create<arith::ConstantIndexOp>(loc, 0);
+    auto dimHIdx = b.create<arith::ConstantIndexOp>(loc, dimH);
+    auto dimWIdx = b.create<arith::ConstantIndexOp>(loc, dimW);
+
+    arith::CmpIOp testTop, testBottom, testLeft, testRight;
+    arith::AndIOp testHeight, testWidth, testAll;
+
+    testTop = b.create<arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::uge,
+                                      heightIdx, zeroIdx);
+    testBottom = b.create<arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ult,
+                                         heightIdx, dimHIdx);
+    testLeft = b.create<arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::uge,
+                                       widthIdx, zeroIdx);
+    testRight = b.create<arith::CmpIOp>(loc, mlir::arith::CmpIPredicate::ult,
+                                        widthIdx, dimWIdx);
+    testHeight = b.create<arith::AndIOp>(loc, testTop, testBottom);
+    testWidth = b.create<arith::AndIOp>(loc, testLeft, testRight);
+    testAll = b.create<arith::AndIOp>(loc, testHeight, testWidth);
+
+    if (genConfig.operation.getValue() == miopen::ConvOpType::BwdData) {
+      auto heightRemSIOp =
+          b.create<arith::RemSIOp>(loc, heightTempIdx, strideHeight);
+      auto widthRemSIOp =
+          b.create<arith::RemSIOp>(loc, widthTempIdx, strideWidth);
+      auto testHeightTemp = b.create<arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::eq, heightRemSIOp, zeroIdx);
+      auto testWidthTemp = b.create<arith::CmpIOp>(
+          loc, mlir::arith::CmpIPredicate::eq, widthRemSIOp, zeroIdx);
+      auto testHW = b.create<arith::AndIOp>(loc, testHeightTemp, testWidthTemp);
+      testAll = b.create<arith::AndIOp>(loc, testHW, testAll);
+    }
+    scf::IfOp ifOp = b.create<scf::IfOp>(loc, testAll, false);
+    auto thenBody = ifOp.getThenBodyBuilder();
+
+    // Perform MAC operation
+    SmallVector<mlir::Value, 5> idx1, idx2;
+    BlockArgument opd1, opd2, result;
+
+    switch (genConfig.operation.getValue()) {
+    case miopen::ConvOpType::Fwd:
+      idx1 = getIndices("filter");
+      idx2 = getIndices("input");
+      opd1 = block->getArgument(0);
+      opd2 = block->getArgument(1);
+      result = block->getArgument(2);
+      break;
+    case miopen::ConvOpType::BwdWeight:
+      idx1 = getIndices("output");
+      idx2 = getIndices("input");
+      opd1 = block->getArgument(2);
+      opd2 = block->getArgument(1);
+      result = block->getArgument(0);
+      break;
+    case miopen::ConvOpType::BwdData:
+      idx1 = getIndices("filter");
+      idx2 = getIndices("output");
+      opd1 = block->getArgument(0);
+      opd2 = block->getArgument(2);
+      result = block->getArgument(1);
+      break;
+    }
+    llvm::ArrayRef<mlir::Value> idxRef1(idx1.data(), idx1.size());
+    auto loadOp1 =
+        thenBody.create<memref::LoadOp>(loc, opd1, ValueRange{idxRef1});
+    llvm::ArrayRef<mlir::Value> idxRef2(idx2.data(), idx2.size());
+    auto loadOp2 =
+        thenBody.create<memref::LoadOp>(loc, opd2, ValueRange{idxRef2});
+    auto loadOutput = thenBody.create<memref::LoadOp>(
+        loc, result, ValueRange{ivs[0], ivs[1], ivs[2], ivs[3], ivs[4]});
+    if (elemType.isIntOrIndex()) {
+      auto muliOp = thenBody.create<arith::MulIOp>(loc, loadOp1, loadOp2);
+      auto extsiOp = thenBody.create<arith::ExtSIOp>(loc, elemType, muliOp);
+      auto addiOp = thenBody.create<arith::AddIOp>(loc, loadOutput, extsiOp);
+      auto storeOp = thenBody.create<memref::StoreOp>(
+          loc, addiOp, result,
+          ValueRange{ivs[0], ivs[1], ivs[2], ivs[3], ivs[4]});
+    } else {
+      auto mulfOp = thenBody.create<arith::MulFOp>(loc, loadOp1, loadOp2);
+      auto addfOp = thenBody.create<arith::AddFOp>(loc, loadOutput, mulfOp);
+      auto storeOp = thenBody.create<memref::StoreOp>(
+          loc, addfOp, result,
+          ValueRange{ivs[0], ivs[1], ivs[2], ivs[3], ivs[4]});
+    }
+  };
+
+  // Generate the loop nest
+  mlir::buildAffineLoopNest(b, loc, lowerBounds, upperBounds, steps,
+                            createConv2dLoopNest);
+
+  return;
+}
+
 static func::FuncOp
 createCPUConvFunc(ModuleOp module,
                   const miopen::Conv2dGenerator::Config &genConfig) {
-
   assert(genConfig.operation.hasValue());
   std::string funcName =
       miopen::getNameForConvOpType(genConfig.operation.getValue()).str();
@@ -820,9 +1119,18 @@ createCPUConvFunc(ModuleOp module,
   auto loc = b.getUnknownLoc();
 
   mlir::Type elemType = b.getF32Type();
-  mlir::Type outputElemType = b.getF32Type();
-  if (genConfig.dataTypeStr == "i8") {
+  if (genConfig.dataTypeStr == "f32") {
+  } else if (genConfig.dataTypeStr == "f16") {
+    elemType = b.getF16Type();
+  } else if (genConfig.dataTypeStr == "bf16") {
+    elemType = b.getBF16Type();
+  } else if (genConfig.dataTypeStr == "i8") {
     elemType = b.getI8Type();
+  }
+  mlir::Type outputElemType = elemType;
+  /* QY mlir::Type outputElemType = b.getF32Type(); */
+  
+  if (genConfig.dataTypeStr == "i8") {
     outputElemType = b.getIntegerType(32);
     assert(genConfig.operation.getValue() == miopen::ConvOpType::Fwd);
   }
@@ -837,18 +1145,21 @@ createCPUConvFunc(ModuleOp module,
 
   // Create conv2d_host function
   miopen::Conv2dGenerator conv2dGenerator(genConfig);
-  bool hasWorkspace = conv2dGenerator.hasWorkspace(b);
-  mlir::Type workspaceArgType;
-  if (hasWorkspace) {
-    workspaceArgType = MemRefType::get(
-        ArrayRef<int64_t>(filterDimension.begin(), filterDimension.end()),
-        b.getF32Type());
-  }
-
+  /*
+    bool hasWorkspace = conv2dGenerator.hasWorkspace(b);
+    mlir::Type workspaceArgType;
+    if (hasWorkspace) {
+      workspaceArgType = MemRefType::get(
+          ArrayRef<int64_t>(filterDimension.begin(), filterDimension.end()),
+          b.getF32Type());
+    }
+  */
   SmallVector<mlir::Type, 3> funcArgTypes = {filterType, inputType, outputType};
-  if (hasWorkspace) {
-    funcArgTypes = {filterType, inputType, outputType, workspaceArgType};
-  }
+  /*
+    if (hasWorkspace) {
+      funcArgTypes = {filterType, inputType, outputType, workspaceArgType};
+    }
+  */
   func =
       func::FuncOp::create(loc, funcName, b.getFunctionType(funcArgTypes, {}));
   module.push_back(func);
@@ -856,177 +1167,184 @@ createCPUConvFunc(ModuleOp module,
   // Construct a new Block.
   Block *block = func.addEntryBlock();
   b.setInsertionPoint(block, block->begin());
+  createCPUConvWithMLIR(module, block, genConfig);
+  // Initialize the result tensor
 
-  // Emit memref_cast.
-  // %a0 = memref_cast %arg0 : memref<128x8x3x3xf32> to memref<*xf32>
-  // %a1 = memref_cast %arg1 : memref<128x8x32x32xf32> to memref<*xf32>
-  // %a2 = memref_cast %arg2 : memref<128x128x30x30xf32> to memref<*xf32>
-  auto unrankedMemRefType =
-      UnrankedMemRefType::get(filterType.getElementType(), 0);
+  /*****/
+  /*
+    // Emit memref_cast.
+    // %a0 = memref_cast %arg0 : memref<128x8x3x3xf32> to memref<*xf32>
+    // %a1 = memref_cast %arg1 : memref<128x8x32x32xf32> to memref<*xf32>
+    // %a2 = memref_cast %arg2 : memref<128x128x30x30xf32> to memref<*xf32>
+    auto unrankedMemRefType =
+        UnrankedMemRefType::get(filterType.getElementType(), 0);
 
-  auto unrankedMemRefOutputType =
-      UnrankedMemRefType::get(outputType.getElementType(), 0);
+    auto unrankedMemRefOutputType =
+        UnrankedMemRefType::get(outputType.getElementType(), 0);
 
-  auto filterMemRefCastOp =
-      b.create<memref::CastOp>(loc, unrankedMemRefType, block->getArgument(0));
-  auto inputMemRefCastOp =
-      b.create<memref::CastOp>(loc, unrankedMemRefType, block->getArgument(1));
-  auto outputMemRefCastOp = b.create<memref::CastOp>(
-      loc, unrankedMemRefOutputType, block->getArgument(2));
+    auto filterMemRefCastOp =
+        b.create<memref::CastOp>(loc, unrankedMemRefType,
+    block->getArgument(0)); auto inputMemRefCastOp =
+        b.create<memref::CastOp>(loc, unrankedMemRefType,
+    block->getArgument(1)); auto outputMemRefCastOp = b.create<memref::CastOp>(
+        loc, unrankedMemRefOutputType, block->getArgument(2));
 
-  // Emit ConstantOps to be used for strides, paddings and dilations
-  auto intType = b.getIntegerType(32);
+    // Emit ConstantOps to be used for strides, paddings and dilations
+    auto intType = b.getIntegerType(32);
 
-  auto strideHeightConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.strideHeight, intType);
+    auto strideHeightConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.strideHeight, intType);
 
-  auto strideWidthConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.strideWidth, intType);
+    auto strideWidthConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.strideWidth, intType);
 
-  auto paddingHeightLeftConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.paddingHeightLeft, intType);
+    auto paddingHeightLeftConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.paddingHeightLeft,
+    intType);
 
-  auto paddingHeightRightConstantOp = b.create<arith::ConstantIntOp>(
-      loc, genConfig.paddingHeightRight, intType);
+    auto paddingHeightRightConstantOp = b.create<arith::ConstantIntOp>(
+        loc, genConfig.paddingHeightRight, intType);
 
-  auto paddingWidthLeftConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthLeft, intType);
+    auto paddingWidthLeftConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthLeft,
+    intType);
 
-  auto paddingWidthRightConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthRight, intType);
+    auto paddingWidthRightConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthRight,
+    intType);
 
-  auto dilationHeightConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.dilationHeight, intType);
+    auto dilationHeightConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.dilationHeight, intType);
 
-  auto dilationWidthConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.dilationWidth, intType);
+    auto dilationWidthConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.dilationWidth, intType);
 
-  // Emit ConstantIndex ops
-  // %c_0 = constant 0 : index
-  // %c_1 = constant 1 : index
-  // %c_2 = constant 2 : index
-  // %c_3 = constant 3 : index
-  // %c_4 = constant 4 : index
-  std::vector<arith::ConstantIndexOp> indexOpVec;
-  for (int i = 0; i < 5; i++) {
-    auto indexOp = b.create<arith::ConstantIndexOp>(loc, i);
-    indexOpVec.push_back(indexOp);
-  }
+    // Emit ConstantIndex ops
+    // %c_0 = constant 0 : index
+    // %c_1 = constant 1 : index
+    // %c_2 = constant 2 : index
+    // %c_3 = constant 3 : index
+    // %c_4 = constant 4 : index
+    std::vector<arith::ConstantIndexOp> indexOpVec;
+    for (int i = 0; i < 5; i++) {
+      auto indexOp = b.create<arith::ConstantIndexOp>(loc, i);
+      indexOpVec.push_back(indexOp);
+    }
 
-  auto charType = b.getIntegerType(8);
-  // Emit Constant ops for letters used in layouts
-  //  these numbers are ascii codes , g = 103, k = 107
-  //  %g = constant 103: i8
-  //  %k = constant 107 : i8
-  //  %c = constant 99 : i8
-  //  %y = constant 121 : i8
-  //  %x = constant 120 : i8
-  //  %n = constant 110 : i8
-  //  %h = constant 104 : i8
-  //  %w = constant 119 : i8
-  auto kConstantOp = b.create<arith::ConstantIntOp>(loc, 'k', charType);
-  auto cConstantOp = b.create<arith::ConstantIntOp>(loc, 'c', charType);
-  auto yConstantOp = b.create<arith::ConstantIntOp>(loc, 'y', charType);
-  auto xConstantOp = b.create<arith::ConstantIntOp>(loc, 'x', charType);
-  auto nConstantOp = b.create<arith::ConstantIntOp>(loc, 'n', charType);
-  auto hConstantOp = b.create<arith::ConstantIntOp>(loc, 'h', charType);
-  auto wConstantOp = b.create<arith::ConstantIntOp>(loc, 'w', charType);
-  auto gConstantOp = b.create<arith::ConstantIntOp>(loc, 'g', charType);
+    auto charType = b.getIntegerType(8);
+    // Emit Constant ops for letters used in layouts
+    //  these numbers are ascii codes , g = 103, k = 107
+    //  %g = constant 103: i8
+    //  %k = constant 107 : i8
+    //  %c = constant 99 : i8
+    //  %y = constant 121 : i8
+    //  %x = constant 120 : i8
+    //  %n = constant 110 : i8
+    //  %h = constant 104 : i8
+    //  %w = constant 119 : i8
+    auto kConstantOp = b.create<arith::ConstantIntOp>(loc, 'k', charType);
+    auto cConstantOp = b.create<arith::ConstantIntOp>(loc, 'c', charType);
+    auto yConstantOp = b.create<arith::ConstantIntOp>(loc, 'y', charType);
+    auto xConstantOp = b.create<arith::ConstantIntOp>(loc, 'x', charType);
+    auto nConstantOp = b.create<arith::ConstantIntOp>(loc, 'n', charType);
+    auto hConstantOp = b.create<arith::ConstantIntOp>(loc, 'h', charType);
+    auto wConstantOp = b.create<arith::ConstantIntOp>(loc, 'w', charType);
+    auto gConstantOp = b.create<arith::ConstantIntOp>(loc, 'g', charType);
 
-  // reduce precision if !xdlops
-  auto xdlopsConstantOp =
-      b.create<arith::ConstantIntOp>(loc, genConfig.xdlops, intType);
+    // reduce precision if !xdlops
+    auto xdlopsConstantOp =
+        b.create<arith::ConstantIntOp>(loc, genConfig.xdlops, intType);
 
-  std::unordered_map<char, arith::ConstantIntOp> layoutConstOps;
-  layoutConstOps['g'] = gConstantOp;
-  layoutConstOps['k'] = kConstantOp;
-  layoutConstOps['c'] = cConstantOp;
-  layoutConstOps['y'] = yConstantOp;
-  layoutConstOps['x'] = xConstantOp;
-  layoutConstOps['n'] = nConstantOp;
-  layoutConstOps['h'] = hConstantOp;
-  layoutConstOps['w'] = wConstantOp;
+    std::unordered_map<char, arith::ConstantIntOp> layoutConstOps;
+    layoutConstOps['g'] = gConstantOp;
+    layoutConstOps['k'] = kConstantOp;
+    layoutConstOps['c'] = cConstantOp;
+    layoutConstOps['y'] = yConstantOp;
+    layoutConstOps['x'] = xConstantOp;
+    layoutConstOps['n'] = nConstantOp;
+    layoutConstOps['h'] = hConstantOp;
+    layoutConstOps['w'] = wConstantOp;
 
-  // %3   = alloca() : memref<5xi8>
-  // %4   = alloca() : memref<5xi8>
-  // %5   = alloca() : memref<5xi8>
-  SmallVector<int64_t, 5> layoutVector({5});
-  auto layoutMemRefType = MemRefType::get(
-      ArrayRef<int64_t>(layoutVector.begin(), layoutVector.end()), charType);
-  auto filLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
-  auto inLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
-  auto outLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
+    // %3   = alloca() : memref<5xi8>
+    // %4   = alloca() : memref<5xi8>
+    // %5   = alloca() : memref<5xi8>
+    SmallVector<int64_t, 5> layoutVector({5});
+    auto layoutMemRefType = MemRefType::get(
+        ArrayRef<int64_t>(layoutVector.begin(), layoutVector.end()), charType);
+    auto filLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
+    auto inLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
+    auto outLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
 
-  // Store layouts into layoutAllocOp
-  // store %k, %3[%c_0]: memref<5xi32>
-  std::string fil_layout = genConfig.filterLayout;
-  std::string in_layout = genConfig.inputLayout;
-  std::string out_layout = genConfig.outputLayout;
-  for (int i = 0; i < 5; i++) {
-    b.create<memref::StoreOp>(loc, layoutConstOps[fil_layout[i]],
-                              filLayoutAllocOp, ValueRange{indexOpVec[i]});
-  }
+    // Store layouts into layoutAllocOp
+    // store %k, %3[%c_0]: memref<5xi32>
+    std::string fil_layout = genConfig.filterLayout;
+    std::string in_layout = genConfig.inputLayout;
+    std::string out_layout = genConfig.outputLayout;
+    for (int i = 0; i < 5; i++) {
+      b.create<memref::StoreOp>(loc, layoutConstOps[fil_layout[i]],
+                                filLayoutAllocOp, ValueRange{indexOpVec[i]});
+    }
 
-  for (int i = 0; i < 5; i++) {
-    b.create<memref::StoreOp>(loc, layoutConstOps[in_layout[i]],
-                              inLayoutAllocOp, ValueRange{indexOpVec[i]});
-  }
+    for (int i = 0; i < 5; i++) {
+      b.create<memref::StoreOp>(loc, layoutConstOps[in_layout[i]],
+                                inLayoutAllocOp, ValueRange{indexOpVec[i]});
+    }
 
-  for (int i = 0; i < 5; i++) {
-    b.create<memref::StoreOp>(loc, layoutConstOps[out_layout[i]],
-                              outLayoutAllocOp, ValueRange{indexOpVec[i]});
-  }
+    for (int i = 0; i < 5; i++) {
+      b.create<memref::StoreOp>(loc, layoutConstOps[out_layout[i]],
+                                outLayoutAllocOp, ValueRange{indexOpVec[i]});
+    }
 
-  // Emit memref_cast
-  // %6 = memref_cast %3 : memref<5xi8> to memref<*xi8>
-  // %7 = memref_cast %4 : memref<5xi8> to memref<*xi8>
-  // %8 = memref_cast %5 : memref<5xi8> to memref<*xi8>
-  auto unrankedLayoutMemRefType = UnrankedMemRefType::get(charType, 0);
-  auto filLayoutMemRefCastOp =
-      b.create<memref::CastOp>(loc, unrankedLayoutMemRefType, filLayoutAllocOp);
-  auto inLayoutMemRefCastOp =
-      b.create<memref::CastOp>(loc, unrankedLayoutMemRefType, inLayoutAllocOp);
-  auto outLayoutMemRefCastOp =
-      b.create<memref::CastOp>(loc, unrankedLayoutMemRefType, outLayoutAllocOp);
+    // Emit memref_cast
+    // %6 = memref_cast %3 : memref<5xi8> to memref<*xi8>
+    // %7 = memref_cast %4 : memref<5xi8> to memref<*xi8>
+    // %8 = memref_cast %5 : memref<5xi8> to memref<*xi8>
+    auto unrankedLayoutMemRefType = UnrankedMemRefType::get(charType, 0);
+    auto filLayoutMemRefCastOp =
+        b.create<memref::CastOp>(loc, unrankedLayoutMemRefType,
+    filLayoutAllocOp); auto inLayoutMemRefCastOp = b.create<memref::CastOp>(loc,
+    unrankedLayoutMemRefType, inLayoutAllocOp); auto outLayoutMemRefCastOp =
+        b.create<memref::CastOp>(loc, unrankedLayoutMemRefType,
+    outLayoutAllocOp);
 
-  std::string mcpuFuncName;
+    std::string mcpuFuncName;
 
-  switch (genConfig.operation.getValue()) {
-  case miopen::ConvOpType::Fwd:
-    mcpuFuncName = "mcpuConv2d";
-    break;
-  case miopen::ConvOpType::BwdData:
-    mcpuFuncName = "mcpuConv2dBwdData";
-    break;
-  case miopen::ConvOpType::BwdWeight:
-    mcpuFuncName = "mcpuConv2dBwdWeight";
-    break;
-  }
+    switch (genConfig.operation.getValue()) {
+    case miopen::ConvOpType::Fwd:
+      mcpuFuncName = "mcpuConv2d";
+      break;
+    case miopen::ConvOpType::BwdData:
+      mcpuFuncName = "mcpuConv2dBwdData";
+      break;
+    case miopen::ConvOpType::BwdWeight:
+      mcpuFuncName = "mcpuConv2dBwdWeight";
+      break;
+    }
 
-  if (elemType.isF32()) {
-    mcpuFuncName += "Float";
-  } else if (elemType.isInteger(8)) {
-    mcpuFuncName += "Int8";
-  }
+    if (elemType.isF32()) {
+      mcpuFuncName += "Float";
+    } else if (elemType.isInteger(8)) {
+      mcpuFuncName += "Int8";
+    }
 
-  // Emit cpu convolution function call op
-  auto mcpuConv2dFuncOp = makeFuncDecl(
-      module, mcpuFuncName,
-      {unrankedMemRefType, unrankedMemRefType, unrankedMemRefOutputType,
-       unrankedLayoutMemRefType, unrankedLayoutMemRefType,
-       unrankedLayoutMemRefType, intType, intType, intType, intType, intType,
-       intType, intType, intType, intType});
+    // Emit cpu convolution function call op
+    auto mcpuConv2dFuncOp = makeFuncDecl(
+        module, mcpuFuncName,
+        {unrankedMemRefType, unrankedMemRefType, unrankedMemRefOutputType,
+         unrankedLayoutMemRefType, unrankedLayoutMemRefType,
+         unrankedLayoutMemRefType, intType, intType, intType, intType, intType,
+         intType, intType, intType, intType});
 
-  b.create<func::CallOp>(
-      loc, mcpuConv2dFuncOp,
-      ValueRange{filterMemRefCastOp, inputMemRefCastOp, outputMemRefCastOp,
-                 filLayoutMemRefCastOp, inLayoutMemRefCastOp,
-                 outLayoutMemRefCastOp, strideHeightConstantOp,
-                 strideWidthConstantOp, paddingHeightLeftConstantOp,
-                 paddingHeightRightConstantOp, paddingWidthLeftConstantOp,
-                 paddingWidthRightConstantOp, dilationHeightConstantOp,
-                 dilationWidthConstantOp, xdlopsConstantOp});
-
+    b.create<func::CallOp>(
+        loc, mcpuConv2dFuncOp,
+        ValueRange{filterMemRefCastOp, inputMemRefCastOp, outputMemRefCastOp,
+                   filLayoutMemRefCastOp, inLayoutMemRefCastOp,
+                   outLayoutMemRefCastOp, strideHeightConstantOp,
+                   strideWidthConstantOp, paddingHeightLeftConstantOp,
+                   paddingHeightRightConstantOp, paddingWidthLeftConstantOp,
+                   paddingWidthRightConstantOp, dilationHeightConstantOp,
+                   dilationWidthConstantOp, xdlopsConstantOp});
+  */
   // Emit return op
   b.create<func::ReturnOp>(loc, ValueRange{});
 
@@ -1186,6 +1504,7 @@ static void emitPrintTensor(OpBuilder &b, mlir::Value var) {
 static func::FuncOp
 createVerifierFunc(ModuleOp &module, const KernelIF &kernel,
                    const miopen::Conv2dGenerator::Config &genConfig) {
+
   auto kfunc = kernel.func;
   std::string funcName = kfunc.getName().str() + "_verify";
   func::FuncOp func = module.lookupSymbol<func::FuncOp>(funcName);
@@ -1200,7 +1519,7 @@ createVerifierFunc(ModuleOp &module, const KernelIF &kernel,
   assert(genConfig.operation.hasValue());
 
   mlir::Type elemType = floatType; // @@@@
-  mlir::Type cpuElemType = floatType;
+  //mlir::Type cpuElemType = floatType; //QY
   if (genConfig.dataTypeStr == "f32") {
   } else if (genConfig.dataTypeStr == "f16") {
     elemType = b.getF16Type();
@@ -1208,13 +1527,15 @@ createVerifierFunc(ModuleOp &module, const KernelIF &kernel,
     elemType = b.getBF16Type();
   } else if (genConfig.dataTypeStr == "i8") {
     elemType = b.getI8Type();
-    cpuElemType = b.getI8Type();
-    if (genConfig.operation.getValue() == miopen::ConvOpType::Fwd) {
-      elemType = intType;
-      cpuElemType = intType;
-    }
+  }
+  mlir::Type cpuElemType = elemType; // QY
+  if (genConfig.dataTypeStr == "i8") {
+    cpuElemType = intType;
+    assert(genConfig.operation.getValue() == miopen::ConvOpType::Fwd);
   }
 
+  auto filterDimension = genConfig.filterDimension;
+  auto inputDimension = genConfig.inputDimension;
   SmallVector<int64_t, 5> dims;
   switch (genConfig.operation.getValue()) {
   case miopen::ConvOpType::Fwd:
@@ -1346,8 +1667,13 @@ createVerifierFunc(ModuleOp &module, const KernelIF &kernel,
 
   // Lower cpu values to gpu precision
   if (elemType.isF16() || elemType.isBF16()) {
-    cpuLoadVal = loopB.create<arith::TruncFOp>(loc, elemFType, cpuLoadVal);
+    if ( cpuElemType != elemFType )
+      cpuLoadVal = loopB.create<arith::TruncFOp>(loc, elemFType, cpuLoadVal);
     gpuPrintVal = loopB.create<arith::ExtFOp>(loc, floatType, gpuLoadVal);
+  }
+  if (cpuElemType != floatType)
+  {
+    cpuPrintVal = loopB.create<arith::ExtFOp>(loc, floatType, cpuLoadVal);
   }
 
   mlir::Value percentDiffVal;
@@ -1624,7 +1950,8 @@ populateHostHarnessLogic(ModuleOp &module,
     if (hasValidation ||
         (isCPUKernel && (elemType.isF16() || elemType.isBF16()))) {
       // Emit validation var
-      mlir::Type valElemType = floatType;
+      // mlir::Type valElemType = floatType; //qy
+      mlir::Type valElemType = elemType;
       if (genConfig.dataTypeStr == "i8") {
         valElemType = elemType;
       }
@@ -1757,7 +2084,7 @@ populateHostHarnessLogic(ModuleOp &module,
     b.create<func::CallOp>(loc, verifierFunc,
                            ValueRange{testResult, valResult});
   }
-
+/*
   // Print and cleanup validation vars
   for (auto &vvar : valVars) {
     // print vvar
@@ -1778,7 +2105,7 @@ populateHostHarnessLogic(ModuleOp &module,
     // dealloc lvar
     b.create<memref::DeallocOp>(loc, lvar);
   }
-
+*/
   b.create<func::ReturnOp>(loc, ValueRange{});
 
   return success();
