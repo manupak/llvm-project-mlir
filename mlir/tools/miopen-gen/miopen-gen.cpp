@@ -300,10 +300,28 @@ static cl::opt<bool> genCPUValidation("pv", cl::Hidden, cl::init(false),
                                       cl::Optional,
                                       cl::cb<void, bool>([](bool v) {
                                         if (v) {
-                                          genValidation.setValue("cpu");
+                                          genValidation.setValue("mlir");
                                           genHostHarness.setValue(true);
                                         }
                                       }));
+
+static cl::opt<bool> genCPPValidation("pv_with_cpp", cl::Hidden,
+                                      cl::init(false), cl::Optional,
+                                      cl::cb<void, bool>([](bool v) {
+                                        if (v) {
+                                          genValidation.setValue("cpp");
+                                          genHostHarness.setValue(true);
+                                        }
+                                      }));
+
+static cl::opt<bool> genMLIRValidation("pv_with_mlir", cl::Hidden,
+                                       cl::init(false), cl::Optional,
+                                       cl::cb<void, bool>([](bool v) {
+                                         if (v) {
+                                           genValidation.setValue("mlir");
+                                           genHostHarness.setValue(true);
+                                         }
+                                       }));
 
 static cl::opt<bool> genGPUValidation("pv_with_gpu", cl::Hidden,
                                       cl::init(false), cl::Optional,
@@ -840,9 +858,11 @@ getConv2dBounds(miopen::ConvOpType dir,
 }
 
 static void
-createCPUConvWithMLIR(ModuleOp module, Block *block,
+createCPUConvWithMLIR(ModuleOp module, func::FuncOp &func,
                       const miopen::Conv2dGenerator::Config &genConfig) {
   OpBuilder b(module.getContext());
+
+  Block *block = func.addEntryBlock();
   b.setInsertionPoint(block, block->begin());
 
   auto loc = b.getUnknownLoc();
@@ -1100,6 +1120,7 @@ createCPUConvWithMLIR(ModuleOp module, Block *block,
   mlir::buildAffineLoopNest(b, loc, lowerBounds, upperBounds, steps,
                             createConv2dLoopNest);
 
+  b.create<func::ReturnOp>(loc, ValueRange{});
   return;
 }
 
@@ -1119,18 +1140,9 @@ createCPUConvFunc(ModuleOp module,
   auto loc = b.getUnknownLoc();
 
   mlir::Type elemType = b.getF32Type();
-  if (genConfig.dataTypeStr == "f32") {
-  } else if (genConfig.dataTypeStr == "f16") {
-    elemType = b.getF16Type();
-  } else if (genConfig.dataTypeStr == "bf16") {
-    elemType = b.getBF16Type();
-  } else if (genConfig.dataTypeStr == "i8") {
-    elemType = b.getI8Type();
-  }
-  mlir::Type outputElemType = elemType;
-  /* QY mlir::Type outputElemType = b.getF32Type(); */
-  
+  mlir::Type outputElemType = b.getF32Type();
   if (genConfig.dataTypeStr == "i8") {
+    elemType = b.getI8Type();
     outputElemType = b.getIntegerType(32);
     assert(genConfig.operation.getValue() == miopen::ConvOpType::Fwd);
   }
@@ -1145,206 +1157,206 @@ createCPUConvFunc(ModuleOp module,
 
   // Create conv2d_host function
   miopen::Conv2dGenerator conv2dGenerator(genConfig);
-  /*
-    bool hasWorkspace = conv2dGenerator.hasWorkspace(b);
-    mlir::Type workspaceArgType;
-    if (hasWorkspace) {
-      workspaceArgType = MemRefType::get(
-          ArrayRef<int64_t>(filterDimension.begin(), filterDimension.end()),
-          b.getF32Type());
-    }
-  */
+
+  bool hasWorkspace = conv2dGenerator.hasWorkspace(b);
+  mlir::Type workspaceArgType;
+  if (hasWorkspace) {
+    workspaceArgType = MemRefType::get(
+        ArrayRef<int64_t>(filterDimension.begin(), filterDimension.end()),
+        b.getF32Type());
+  }
+
   SmallVector<mlir::Type, 3> funcArgTypes = {filterType, inputType, outputType};
-  /*
-    if (hasWorkspace) {
-      funcArgTypes = {filterType, inputType, outputType, workspaceArgType};
-    }
-  */
+
+  if (hasWorkspace) {
+    funcArgTypes = {filterType, inputType, outputType, workspaceArgType};
+  }
+
   func =
       func::FuncOp::create(loc, funcName, b.getFunctionType(funcArgTypes, {}));
   module.push_back(func);
 
+  if (genValidation.getValue() == "mlir" && !genCPUKernel.getValue()) {
+    createCPUConvWithMLIR(module, func, genConfig);
+    return func;
+  }
+
   // Construct a new Block.
   Block *block = func.addEntryBlock();
   b.setInsertionPoint(block, block->begin());
-  createCPUConvWithMLIR(module, block, genConfig);
+
   // Initialize the result tensor
 
   /*****/
-  /*
-    // Emit memref_cast.
-    // %a0 = memref_cast %arg0 : memref<128x8x3x3xf32> to memref<*xf32>
-    // %a1 = memref_cast %arg1 : memref<128x8x32x32xf32> to memref<*xf32>
-    // %a2 = memref_cast %arg2 : memref<128x128x30x30xf32> to memref<*xf32>
-    auto unrankedMemRefType =
-        UnrankedMemRefType::get(filterType.getElementType(), 0);
+  // Emit memref_cast.
+  // %a0 = memref_cast %arg0 : memref<128x8x3x3xf32> to memref<*xf32>
+  // %a1 = memref_cast %arg1 : memref<128x8x32x32xf32> to memref<*xf32>
+  // %a2 = memref_cast %arg2 : memref<128x128x30x30xf32> to memref<*xf32>
+  auto unrankedMemRefType =
+      UnrankedMemRefType::get(filterType.getElementType(), 0);
 
-    auto unrankedMemRefOutputType =
-        UnrankedMemRefType::get(outputType.getElementType(), 0);
+  auto unrankedMemRefOutputType =
+      UnrankedMemRefType::get(outputType.getElementType(), 0);
 
-    auto filterMemRefCastOp =
-        b.create<memref::CastOp>(loc, unrankedMemRefType,
-    block->getArgument(0)); auto inputMemRefCastOp =
-        b.create<memref::CastOp>(loc, unrankedMemRefType,
-    block->getArgument(1)); auto outputMemRefCastOp = b.create<memref::CastOp>(
-        loc, unrankedMemRefOutputType, block->getArgument(2));
+  auto filterMemRefCastOp =
+      b.create<memref::CastOp>(loc, unrankedMemRefType, block->getArgument(0));
+  auto inputMemRefCastOp =
+      b.create<memref::CastOp>(loc, unrankedMemRefType, block->getArgument(1));
+  auto outputMemRefCastOp = b.create<memref::CastOp>(
+      loc, unrankedMemRefOutputType, block->getArgument(2));
 
-    // Emit ConstantOps to be used for strides, paddings and dilations
-    auto intType = b.getIntegerType(32);
+  // Emit ConstantOps to be used for strides, paddings and dilations
+  auto intType = b.getIntegerType(32);
 
-    auto strideHeightConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.strideHeight, intType);
+  auto strideHeightConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.strideHeight, intType);
 
-    auto strideWidthConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.strideWidth, intType);
+  auto strideWidthConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.strideWidth, intType);
 
-    auto paddingHeightLeftConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.paddingHeightLeft,
-    intType);
+  auto paddingHeightLeftConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.paddingHeightLeft, intType);
 
-    auto paddingHeightRightConstantOp = b.create<arith::ConstantIntOp>(
-        loc, genConfig.paddingHeightRight, intType);
+  auto paddingHeightRightConstantOp = b.create<arith::ConstantIntOp>(
+      loc, genConfig.paddingHeightRight, intType);
 
-    auto paddingWidthLeftConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthLeft,
-    intType);
+  auto paddingWidthLeftConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthLeft, intType);
 
-    auto paddingWidthRightConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthRight,
-    intType);
+  auto paddingWidthRightConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.paddingWidthRight, intType);
 
-    auto dilationHeightConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.dilationHeight, intType);
+  auto dilationHeightConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.dilationHeight, intType);
 
-    auto dilationWidthConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.dilationWidth, intType);
+  auto dilationWidthConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.dilationWidth, intType);
 
-    // Emit ConstantIndex ops
-    // %c_0 = constant 0 : index
-    // %c_1 = constant 1 : index
-    // %c_2 = constant 2 : index
-    // %c_3 = constant 3 : index
-    // %c_4 = constant 4 : index
-    std::vector<arith::ConstantIndexOp> indexOpVec;
-    for (int i = 0; i < 5; i++) {
-      auto indexOp = b.create<arith::ConstantIndexOp>(loc, i);
-      indexOpVec.push_back(indexOp);
-    }
+  // Emit ConstantIndex ops
+  // %c_0 = constant 0 : index
+  // %c_1 = constant 1 : index
+  // %c_2 = constant 2 : index
+  // %c_3 = constant 3 : index
+  // %c_4 = constant 4 : index
+  std::vector<arith::ConstantIndexOp> indexOpVec;
+  for (int i = 0; i < 5; i++) {
+    auto indexOp = b.create<arith::ConstantIndexOp>(loc, i);
+    indexOpVec.push_back(indexOp);
+  }
 
-    auto charType = b.getIntegerType(8);
-    // Emit Constant ops for letters used in layouts
-    //  these numbers are ascii codes , g = 103, k = 107
-    //  %g = constant 103: i8
-    //  %k = constant 107 : i8
-    //  %c = constant 99 : i8
-    //  %y = constant 121 : i8
-    //  %x = constant 120 : i8
-    //  %n = constant 110 : i8
-    //  %h = constant 104 : i8
-    //  %w = constant 119 : i8
-    auto kConstantOp = b.create<arith::ConstantIntOp>(loc, 'k', charType);
-    auto cConstantOp = b.create<arith::ConstantIntOp>(loc, 'c', charType);
-    auto yConstantOp = b.create<arith::ConstantIntOp>(loc, 'y', charType);
-    auto xConstantOp = b.create<arith::ConstantIntOp>(loc, 'x', charType);
-    auto nConstantOp = b.create<arith::ConstantIntOp>(loc, 'n', charType);
-    auto hConstantOp = b.create<arith::ConstantIntOp>(loc, 'h', charType);
-    auto wConstantOp = b.create<arith::ConstantIntOp>(loc, 'w', charType);
-    auto gConstantOp = b.create<arith::ConstantIntOp>(loc, 'g', charType);
+  auto charType = b.getIntegerType(8);
+  // Emit Constant ops for letters used in layouts
+  //  these numbers are ascii codes , g = 103, k = 107
+  //  %g = constant 103: i8
+  //  %k = constant 107 : i8
+  //  %c = constant 99 : i8
+  //  %y = constant 121 : i8
+  //  %x = constant 120 : i8
+  //  %n = constant 110 : i8
+  //  %h = constant 104 : i8
+  //  %w = constant 119 : i8
+  auto kConstantOp = b.create<arith::ConstantIntOp>(loc, 'k', charType);
+  auto cConstantOp = b.create<arith::ConstantIntOp>(loc, 'c', charType);
+  auto yConstantOp = b.create<arith::ConstantIntOp>(loc, 'y', charType);
+  auto xConstantOp = b.create<arith::ConstantIntOp>(loc, 'x', charType);
+  auto nConstantOp = b.create<arith::ConstantIntOp>(loc, 'n', charType);
+  auto hConstantOp = b.create<arith::ConstantIntOp>(loc, 'h', charType);
+  auto wConstantOp = b.create<arith::ConstantIntOp>(loc, 'w', charType);
+  auto gConstantOp = b.create<arith::ConstantIntOp>(loc, 'g', charType);
 
-    // reduce precision if !xdlops
-    auto xdlopsConstantOp =
-        b.create<arith::ConstantIntOp>(loc, genConfig.xdlops, intType);
+  // reduce precision if !xdlops
+  auto xdlopsConstantOp =
+      b.create<arith::ConstantIntOp>(loc, genConfig.xdlops, intType);
 
-    std::unordered_map<char, arith::ConstantIntOp> layoutConstOps;
-    layoutConstOps['g'] = gConstantOp;
-    layoutConstOps['k'] = kConstantOp;
-    layoutConstOps['c'] = cConstantOp;
-    layoutConstOps['y'] = yConstantOp;
-    layoutConstOps['x'] = xConstantOp;
-    layoutConstOps['n'] = nConstantOp;
-    layoutConstOps['h'] = hConstantOp;
-    layoutConstOps['w'] = wConstantOp;
+  std::unordered_map<char, arith::ConstantIntOp> layoutConstOps;
+  layoutConstOps['g'] = gConstantOp;
+  layoutConstOps['k'] = kConstantOp;
+  layoutConstOps['c'] = cConstantOp;
+  layoutConstOps['y'] = yConstantOp;
+  layoutConstOps['x'] = xConstantOp;
+  layoutConstOps['n'] = nConstantOp;
+  layoutConstOps['h'] = hConstantOp;
+  layoutConstOps['w'] = wConstantOp;
 
-    // %3   = alloca() : memref<5xi8>
-    // %4   = alloca() : memref<5xi8>
-    // %5   = alloca() : memref<5xi8>
-    SmallVector<int64_t, 5> layoutVector({5});
-    auto layoutMemRefType = MemRefType::get(
-        ArrayRef<int64_t>(layoutVector.begin(), layoutVector.end()), charType);
-    auto filLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
-    auto inLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
-    auto outLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
+  // %3   = alloca() : memref<5xi8>
+  // %4   = alloca() : memref<5xi8>
+  // %5   = alloca() : memref<5xi8>
+  SmallVector<int64_t, 5> layoutVector({5});
+  auto layoutMemRefType = MemRefType::get(
+      ArrayRef<int64_t>(layoutVector.begin(), layoutVector.end()), charType);
+  auto filLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
+  auto inLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
+  auto outLayoutAllocOp = b.create<memref::AllocaOp>(loc, layoutMemRefType);
 
-    // Store layouts into layoutAllocOp
-    // store %k, %3[%c_0]: memref<5xi32>
-    std::string fil_layout = genConfig.filterLayout;
-    std::string in_layout = genConfig.inputLayout;
-    std::string out_layout = genConfig.outputLayout;
-    for (int i = 0; i < 5; i++) {
-      b.create<memref::StoreOp>(loc, layoutConstOps[fil_layout[i]],
-                                filLayoutAllocOp, ValueRange{indexOpVec[i]});
-    }
+  // Store layouts into layoutAllocOp
+  // store %k, %3[%c_0]: memref<5xi32>
+  std::string fil_layout = genConfig.filterLayout;
+  std::string in_layout = genConfig.inputLayout;
+  std::string out_layout = genConfig.outputLayout;
+  for (int i = 0; i < 5; i++) {
+    b.create<memref::StoreOp>(loc, layoutConstOps[fil_layout[i]],
+                              filLayoutAllocOp, ValueRange{indexOpVec[i]});
+  }
 
-    for (int i = 0; i < 5; i++) {
-      b.create<memref::StoreOp>(loc, layoutConstOps[in_layout[i]],
-                                inLayoutAllocOp, ValueRange{indexOpVec[i]});
-    }
+  for (int i = 0; i < 5; i++) {
+    b.create<memref::StoreOp>(loc, layoutConstOps[in_layout[i]],
+                              inLayoutAllocOp, ValueRange{indexOpVec[i]});
+  }
 
-    for (int i = 0; i < 5; i++) {
-      b.create<memref::StoreOp>(loc, layoutConstOps[out_layout[i]],
-                                outLayoutAllocOp, ValueRange{indexOpVec[i]});
-    }
+  for (int i = 0; i < 5; i++) {
+    b.create<memref::StoreOp>(loc, layoutConstOps[out_layout[i]],
+                              outLayoutAllocOp, ValueRange{indexOpVec[i]});
+  }
 
-    // Emit memref_cast
-    // %6 = memref_cast %3 : memref<5xi8> to memref<*xi8>
-    // %7 = memref_cast %4 : memref<5xi8> to memref<*xi8>
-    // %8 = memref_cast %5 : memref<5xi8> to memref<*xi8>
-    auto unrankedLayoutMemRefType = UnrankedMemRefType::get(charType, 0);
-    auto filLayoutMemRefCastOp =
-        b.create<memref::CastOp>(loc, unrankedLayoutMemRefType,
-    filLayoutAllocOp); auto inLayoutMemRefCastOp = b.create<memref::CastOp>(loc,
-    unrankedLayoutMemRefType, inLayoutAllocOp); auto outLayoutMemRefCastOp =
-        b.create<memref::CastOp>(loc, unrankedLayoutMemRefType,
-    outLayoutAllocOp);
+  // Emit memref_cast
+  // %6 = memref_cast %3 : memref<5xi8> to memref<*xi8>
+  // %7 = memref_cast %4 : memref<5xi8> to memref<*xi8>
+  // %8 = memref_cast %5 : memref<5xi8> to memref<*xi8>
+  auto unrankedLayoutMemRefType = UnrankedMemRefType::get(charType, 0);
+  auto filLayoutMemRefCastOp =
+      b.create<memref::CastOp>(loc, unrankedLayoutMemRefType, filLayoutAllocOp);
+  auto inLayoutMemRefCastOp =
+      b.create<memref::CastOp>(loc, unrankedLayoutMemRefType, inLayoutAllocOp);
+  auto outLayoutMemRefCastOp =
+      b.create<memref::CastOp>(loc, unrankedLayoutMemRefType, outLayoutAllocOp);
 
-    std::string mcpuFuncName;
+  std::string mcpuFuncName;
 
-    switch (genConfig.operation.getValue()) {
-    case miopen::ConvOpType::Fwd:
-      mcpuFuncName = "mcpuConv2d";
-      break;
-    case miopen::ConvOpType::BwdData:
-      mcpuFuncName = "mcpuConv2dBwdData";
-      break;
-    case miopen::ConvOpType::BwdWeight:
-      mcpuFuncName = "mcpuConv2dBwdWeight";
-      break;
-    }
+  switch (genConfig.operation.getValue()) {
+  case miopen::ConvOpType::Fwd:
+    mcpuFuncName = "mcpuConv2d";
+    break;
+  case miopen::ConvOpType::BwdData:
+    mcpuFuncName = "mcpuConv2dBwdData";
+    break;
+  case miopen::ConvOpType::BwdWeight:
+    mcpuFuncName = "mcpuConv2dBwdWeight";
+    break;
+  }
 
-    if (elemType.isF32()) {
-      mcpuFuncName += "Float";
-    } else if (elemType.isInteger(8)) {
-      mcpuFuncName += "Int8";
-    }
+  if (elemType.isF32()) {
+    mcpuFuncName += "Float";
+  } else if (elemType.isInteger(8)) {
+    mcpuFuncName += "Int8";
+  }
 
-    // Emit cpu convolution function call op
-    auto mcpuConv2dFuncOp = makeFuncDecl(
-        module, mcpuFuncName,
-        {unrankedMemRefType, unrankedMemRefType, unrankedMemRefOutputType,
-         unrankedLayoutMemRefType, unrankedLayoutMemRefType,
-         unrankedLayoutMemRefType, intType, intType, intType, intType, intType,
-         intType, intType, intType, intType});
+  // Emit cpu convolution function call op
+  auto mcpuConv2dFuncOp = makeFuncDecl(
+      module, mcpuFuncName,
+      {unrankedMemRefType, unrankedMemRefType, unrankedMemRefOutputType,
+       unrankedLayoutMemRefType, unrankedLayoutMemRefType,
+       unrankedLayoutMemRefType, intType, intType, intType, intType, intType,
+       intType, intType, intType, intType});
 
-    b.create<func::CallOp>(
-        loc, mcpuConv2dFuncOp,
-        ValueRange{filterMemRefCastOp, inputMemRefCastOp, outputMemRefCastOp,
-                   filLayoutMemRefCastOp, inLayoutMemRefCastOp,
-                   outLayoutMemRefCastOp, strideHeightConstantOp,
-                   strideWidthConstantOp, paddingHeightLeftConstantOp,
-                   paddingHeightRightConstantOp, paddingWidthLeftConstantOp,
-                   paddingWidthRightConstantOp, dilationHeightConstantOp,
-                   dilationWidthConstantOp, xdlopsConstantOp});
-  */
+  b.create<func::CallOp>(
+      loc, mcpuConv2dFuncOp,
+      ValueRange{filterMemRefCastOp, inputMemRefCastOp, outputMemRefCastOp,
+                 filLayoutMemRefCastOp, inLayoutMemRefCastOp,
+                 outLayoutMemRefCastOp, strideHeightConstantOp,
+                 strideWidthConstantOp, paddingHeightLeftConstantOp,
+                 paddingHeightRightConstantOp, paddingWidthLeftConstantOp,
+                 paddingWidthRightConstantOp, dilationHeightConstantOp,
+                 dilationWidthConstantOp, xdlopsConstantOp});
   // Emit return op
   b.create<func::ReturnOp>(loc, ValueRange{});
 
@@ -1519,19 +1531,16 @@ createVerifierFunc(ModuleOp &module, const KernelIF &kernel,
   assert(genConfig.operation.hasValue());
 
   mlir::Type elemType = floatType; // @@@@
-  //mlir::Type cpuElemType = floatType; //QY
+  mlir::Type cpuElemType;
+  cpuElemType = floatType;
   if (genConfig.dataTypeStr == "f32") {
   } else if (genConfig.dataTypeStr == "f16") {
     elemType = b.getF16Type();
   } else if (genConfig.dataTypeStr == "bf16") {
     elemType = b.getBF16Type();
   } else if (genConfig.dataTypeStr == "i8") {
-    elemType = b.getI8Type();
-  }
-  mlir::Type cpuElemType = elemType; // QY
-  if (genConfig.dataTypeStr == "i8") {
+    elemType = intType;
     cpuElemType = intType;
-    assert(genConfig.operation.getValue() == miopen::ConvOpType::Fwd);
   }
 
   auto filterDimension = genConfig.filterDimension;
@@ -1667,13 +1676,11 @@ createVerifierFunc(ModuleOp &module, const KernelIF &kernel,
 
   // Lower cpu values to gpu precision
   if (elemType.isF16() || elemType.isBF16()) {
-    if ( cpuElemType != elemFType )
+    if (cpuElemType != elemFType)
       cpuLoadVal = loopB.create<arith::TruncFOp>(loc, elemFType, cpuLoadVal);
+    if (cpuElemType != floatType)
+      cpuPrintVal = loopB.create<arith::ExtFOp>(loc, floatType, cpuLoadVal);
     gpuPrintVal = loopB.create<arith::ExtFOp>(loc, floatType, gpuLoadVal);
-  }
-  if (cpuElemType != floatType)
-  {
-    cpuPrintVal = loopB.create<arith::ExtFOp>(loc, floatType, cpuLoadVal);
   }
 
   mlir::Value percentDiffVal;
@@ -1950,8 +1957,8 @@ populateHostHarnessLogic(ModuleOp &module,
     if (hasValidation ||
         (isCPUKernel && (elemType.isF16() || elemType.isBF16()))) {
       // Emit validation var
-      // mlir::Type valElemType = floatType; //qy
       mlir::Type valElemType = elemType;
+      valElemType = floatType; // QY fix this later
       if (genConfig.dataTypeStr == "i8") {
         valElemType = elemType;
       }
@@ -2070,7 +2077,7 @@ populateHostHarnessLogic(ModuleOp &module,
         b.create<func::CallOp>(loc, kernelWrapperFunc, valVars);
       }
       conv2dGenerator.setKernelName(kernelBaseName);
-    } else { // if (validationType == "cpu")
+    } else { // -pv_with_cpp ,-pv_with_mlir, or -prc
       // Emit call to host_<conv>
       auto cpuConvFunc = createCPUConvFunc(module, genConfig);
       b.create<func::CallOp>(loc, cpuConvFunc, valVars);
@@ -2084,7 +2091,7 @@ populateHostHarnessLogic(ModuleOp &module,
     b.create<func::CallOp>(loc, verifierFunc,
                            ValueRange{testResult, valResult});
   }
-/*
+
   // Print and cleanup validation vars
   for (auto &vvar : valVars) {
     // print vvar
@@ -2105,7 +2112,7 @@ populateHostHarnessLogic(ModuleOp &module,
     // dealloc lvar
     b.create<memref::DeallocOp>(loc, lvar);
   }
-*/
+
   b.create<func::ReturnOp>(loc, ValueRange{});
 
   return success();
