@@ -337,6 +337,7 @@ static cl::opt<bool> genCPUKernel("cpu-kernels",
                                   cl::init(false), cl::Optional,
                                   cl::cb<void, bool>([](bool v) {
                                     if (v) {
+                                      genValidation.setValue("mlir");
                                       genHostHarness.setValue(true);
                                       printResults.setValue(true);
                                     }
@@ -1124,70 +1125,25 @@ createCPUConvWithMLIR(ModuleOp module, func::FuncOp &func,
   return;
 }
 
-static func::FuncOp
-createCPUConvFunc(ModuleOp module,
-                  const miopen::Conv2dGenerator::Config &genConfig) {
-  assert(genConfig.operation.hasValue());
-  std::string funcName =
-      miopen::getNameForConvOpType(genConfig.operation.getValue()).str();
-
-  funcName += "_cpu";
-  func::FuncOp func = module.lookupSymbol<func::FuncOp>(funcName);
-  if (func) // already exists
-    return func;
-
+static void
+createCPUConvWithCPP(ModuleOp module, func::FuncOp &func,
+                     const miopen::Conv2dGenerator::Config &genConfig) {
   OpBuilder b(module.getContext());
-  auto loc = b.getUnknownLoc();
 
-  mlir::Type elemType = b.getF32Type();
-  mlir::Type outputElemType = b.getF32Type();
-  if (genConfig.dataTypeStr == "i8") {
-    elemType = b.getI8Type();
-    outputElemType = b.getIntegerType(32);
-    assert(genConfig.operation.getValue() == miopen::ConvOpType::Fwd);
-  }
-
-  auto filterDimension = genConfig.filterDimension;
-  auto inputDimension = genConfig.inputDimension;
-  auto outputDimension = genConfig.outputDimension;
-
-  auto filterType = MemRefType::get(filterDimension, elemType);
-  auto inputType = MemRefType::get(inputDimension, elemType);
-  auto outputType = MemRefType::get(outputDimension, outputElemType);
-
-  // Create conv2d_host function
-  miopen::Conv2dGenerator conv2dGenerator(genConfig);
-
-  bool hasWorkspace = conv2dGenerator.hasWorkspace(b);
-  mlir::Type workspaceArgType;
-  if (hasWorkspace) {
-    workspaceArgType = MemRefType::get(
-        ArrayRef<int64_t>(filterDimension.begin(), filterDimension.end()),
-        b.getF32Type());
-  }
-
-  SmallVector<mlir::Type, 3> funcArgTypes = {filterType, inputType, outputType};
-
-  if (hasWorkspace) {
-    funcArgTypes = {filterType, inputType, outputType, workspaceArgType};
-  }
-
-  func =
-      func::FuncOp::create(loc, funcName, b.getFunctionType(funcArgTypes, {}));
-  module.push_back(func);
-
-  if (genValidation.getValue() == "mlir" && !genCPUKernel.getValue()) {
-    createCPUConvWithMLIR(module, func, genConfig);
-    return func;
-  }
-
-  // Construct a new Block.
   Block *block = func.addEntryBlock();
   b.setInsertionPoint(block, block->begin());
 
-  // Initialize the result tensor
+  auto loc = b.getUnknownLoc();
 
-  /*****/
+  mlir::Type elemType = b.getF32Type();
+  if (genConfig.dataTypeStr == "i8") {
+    elemType = b.getI8Type();
+  }
+
+  auto filterType =
+      block->getArgument(0).getType().template dyn_cast<MemRefType>();
+  auto outputType =
+      block->getArgument(2).getType().template dyn_cast<MemRefType>();
   // Emit memref_cast.
   // %a0 = memref_cast %arg0 : memref<128x8x3x3xf32> to memref<*xf32>
   // %a1 = memref_cast %arg1 : memref<128x8x32x32xf32> to memref<*xf32>
@@ -1357,8 +1313,69 @@ createCPUConvFunc(ModuleOp module,
                  paddingHeightRightConstantOp, paddingWidthLeftConstantOp,
                  paddingWidthRightConstantOp, dilationHeightConstantOp,
                  dilationWidthConstantOp, xdlopsConstantOp});
+
   // Emit return op
   b.create<func::ReturnOp>(loc, ValueRange{});
+  return;
+}
+
+static func::FuncOp
+createCPUConvFunc(ModuleOp module,
+                  const miopen::Conv2dGenerator::Config &genConfig) {
+  assert(genConfig.operation.hasValue());
+  std::string funcName =
+      miopen::getNameForConvOpType(genConfig.operation.getValue()).str();
+
+  funcName += "_cpu";
+  func::FuncOp func = module.lookupSymbol<func::FuncOp>(funcName);
+  if (func) // already exists
+    return func;
+
+  OpBuilder b(module.getContext());
+  auto loc = b.getUnknownLoc();
+
+  mlir::Type elemType = b.getF32Type();
+  mlir::Type outputElemType = b.getF32Type();
+  if (genConfig.dataTypeStr == "i8") {
+    elemType = b.getI8Type();
+    outputElemType = b.getIntegerType(32);
+    assert(genConfig.operation.getValue() == miopen::ConvOpType::Fwd);
+  }
+
+  auto filterDimension = genConfig.filterDimension;
+  auto inputDimension = genConfig.inputDimension;
+  auto outputDimension = genConfig.outputDimension;
+
+  auto filterType = MemRefType::get(filterDimension, elemType);
+  auto inputType = MemRefType::get(inputDimension, elemType);
+  auto outputType = MemRefType::get(outputDimension, outputElemType);
+
+  // Create conv2d_host function
+  miopen::Conv2dGenerator conv2dGenerator(genConfig);
+
+  bool hasWorkspace = conv2dGenerator.hasWorkspace(b);
+  mlir::Type workspaceArgType;
+  if (hasWorkspace) {
+    workspaceArgType = MemRefType::get(
+        ArrayRef<int64_t>(filterDimension.begin(), filterDimension.end()),
+        b.getF32Type());
+  }
+
+  SmallVector<mlir::Type, 3> funcArgTypes = {filterType, inputType, outputType};
+
+  if (hasWorkspace) {
+    funcArgTypes = {filterType, inputType, outputType, workspaceArgType};
+  }
+
+  func =
+      func::FuncOp::create(loc, funcName, b.getFunctionType(funcArgTypes, {}));
+  module.push_back(func);
+
+  if (genValidation.getValue() == "mlir") { // -pv_with_mlir or -prc
+    createCPUConvWithMLIR(module, func, genConfig);
+  } else { // -pv_with_cpp
+    createCPUConvWithCPP(module, func, genConfig);
+  }
 
   return func;
 }
@@ -1909,7 +1926,7 @@ populateHostHarnessLogic(ModuleOp &module,
   }
   auto root0 = *roots.begin();
   bool isCPUKernel = !root0.func->hasAttr("kernel");
-  bool hasValidation = !validationType.empty();
+  bool hasValidation = !validationType.empty() && !genCPUKernel.getValue();
   SmallVector<mlir::Value, 5> localVars;
   SmallVector<mlir::Value, 5> valVars;
   int32_t idx = 0;
@@ -2077,7 +2094,7 @@ populateHostHarnessLogic(ModuleOp &module,
         b.create<func::CallOp>(loc, kernelWrapperFunc, valVars);
       }
       conv2dGenerator.setKernelName(kernelBaseName);
-    } else { // -pv_with_cpp ,-pv_with_mlir, or -prc
+    } else { // -pv_with_cpp or -pv_with_mlir (-pv)
       // Emit call to host_<conv>
       auto cpuConvFunc = createCPUConvFunc(module, genConfig);
       b.create<func::CallOp>(loc, cpuConvFunc, valVars);
