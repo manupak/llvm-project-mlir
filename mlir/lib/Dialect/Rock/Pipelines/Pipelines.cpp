@@ -53,10 +53,12 @@ void rock::buildBufferizePipeline(OpPassManager &pm,
   // (see mlir/lib/Conversion/TosaToLinalg/TosaToLinalgPass.cpp)
   mlir::tosa::addTosaToLinalgPasses(pm);
 
+
   // linalg tensor opts
   /* rocmlir-opt --linalg-fuse-elementwise-ops
    */
   pm.addNestedPass<func::FuncOp>(createLinalgElementwiseOpFusionPass());
+  pm.addNestedPass<func::FuncOp>(createLinalgFoldUnitExtentDimsPass());
 
   // for tosa control flow
   /* rocmlir-opt --tosa-to-scf --tosa-to-arith
@@ -77,6 +79,8 @@ void rock::buildBufferizePipeline(OpPassManager &pm,
 
   pm.addPass(createConvertTensorToLinalgPass());
   pm.addNestedPass<func::FuncOp>(createLinalgInitTensorToAllocTensorPass());
+  pm.addNestedPass<func::FuncOp>(createLinalgFoldUnitExtentDimsPass());
+  pm.addNestedPass<func::FuncOp>(memref::createFoldMemRefAliasOpsPass());
 
   bufferization::OneShotBufferizationOptions bufOpts;
   bufOpts.allowReturnAllocs = true;

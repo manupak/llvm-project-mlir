@@ -170,12 +170,17 @@ static Value makeBroadcast(PatternRewriter &b, MemRefType outType, Value inp,
   return inp;
 }
 
+static Value maybeFindRootViewSource(Value value){
+  while (auto viewOp = value.getDefiningOp<ViewLikeOpInterface>()) {
+    value = viewOp.getViewSource();
+  }
+  return value;
+}
+
 static void insertLoadFromOtherSource(PatternRewriter &b, Location loc,
                                       GlobalStoreOp gemmStoreOp, Value srcOp,
                                       Value dest) {
-  while (auto expOp = srcOp.getDefiningOp<memref::ExpandShapeOp>()) {
-    srcOp = expOp.getOperand();
-  }
+  srcOp = maybeFindRootViewSource(srcOp);
   LLVM_DEBUG(llvm::dbgs() << "Src type: " << srcOp.getType() << " dest type: "
                           << gemmStoreOp.getDest().getType() << "\n");
   ArrayRef<int64_t> sType, dType;
@@ -303,12 +308,18 @@ Value applyTransforms(PatternRewriter &b, GlobalStoreOp gemmStoreOp, Value inp,
   return makeTransformingCopyLoop(b, gemmStoreOp, ret);
 }
 
+
 static GlobalStoreOp traceToGlobalStore(Value inp) {
   // 1. Validate that the only uses of the linalg.generic input are the one
   // generic and a copy operation or transform.
+  inp = maybeFindRootViewSource(inp);
   bool allValidUses = true;
   GlobalStoreOp result;
   for (Operation *use : inp.getUsers()) {
+    if (isa<ViewLikeOpInterface>(use)) {
+      // ignore
+      continue;
+    }
     if (isa<memref::DeallocOp>(use)) {
       // ignore
       continue;
@@ -324,25 +335,29 @@ static GlobalStoreOp traceToGlobalStore(Value inp) {
       }
       result = store;
     } else {
+      llvm::errs() << *use << "\n";
       allValidUses = false;
     }
   }
 
   // Additionally catch the case when gemm result had to be expanded before
   // being fed.
-  if (auto expanded = inp.getDefiningOp<memref::ExpandShapeOp>()) {
-    auto src = expanded.getSrc();
-    for (Operation *use : src.getUsers()) {
-      if (auto store = dyn_cast<GlobalStoreOp>(use)) {
-        if (result) {
-          LLVM_DEBUG(llvm::dbgs()
-                     << "Multiple global stores somehow, no fusion\n");
-          allValidUses = false;
-        }
-        result = store;
-      }
-    }
-  }
+
+
+
+  // if (auto expanded = inp.getDefiningOp<memref::ExpandShapeOp>()) {
+  //   auto src = expanded.getSrc();
+  //   for (Operation *use : src.getUsers()) {
+  //     if (auto store = dyn_cast<GlobalStoreOp>(use)) {
+  //       if (result) {
+  //         LLVM_DEBUG(llvm::dbgs()
+  //                    << "Multiple global stores somehow, no fusion\n");
+  //         allValidUses = false;
+  //       }
+  //       result = store;
+  //     }
+  //   }
+  // }
 
   if (!result)
     LLVM_DEBUG(llvm::dbgs() << "Align tiling: generic not tracing to copy");
@@ -368,8 +383,8 @@ static Value reconfigureLAGeneric(PatternRewriter &b,
     if (Value inp = std::get<0>(pair)) {
       AffineMap inpIdxMap = std::get<1>(pair);
       Value newInput;
-      auto expanded = inp.getDefiningOp<memref::ExpandShapeOp>();
-      if (inp == twout || (expanded && expanded.getSrc() == twout)) {
+      auto viewSrc = maybeFindRootViewSource(inp);
+      if (inp == twout || (viewSrc == twout)) {
         newInput = laIn;
       } else {
         // 2.1.1. Align tiling of other inputs
@@ -477,10 +492,7 @@ LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
   // 2. Apply if input found
 
   // point back to original memory.
-  if (memref::ExpandShapeOp expanded =
-          out.getDefiningOp<memref::ExpandShapeOp>()) {
-    out = expanded.getSrc();
-  }
+  out = maybeFindRootViewSource(out);
 
   Value gemmOuts = gemmStoreOp.getSource();
   auto gemmOutsType = gemmOuts.getType().cast<MemRefType>();
