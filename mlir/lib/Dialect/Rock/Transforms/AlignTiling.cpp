@@ -104,13 +104,12 @@ makeTransposeTransform(PatternRewriter &b, Value inp, AffineMap inpMap) {
   return {inp, inpMap};
 }
 
-static Value makeBroadcast(PatternRewriter &b, MemRefType outType, Value inp,
+static Value makeBroadcast(PatternRewriter &b, ArrayRef<int64_t> outShape, Value inp,
                            AffineMap inpIdxMap) {
   if (!inpIdxMap.isIdentity()) {
     Location loc = inp.getLoc();
     auto inpType = inp.getType().template cast<MemRefType>();
     ArrayRef<int64_t> inpShape = inpType.getShape();
-    ArrayRef<int64_t> outShape = outType.getShape();
 
     uint32_t diff = outShape.size() - inpShape.size();
     SmallVector<uint32_t> bcastDims;
@@ -170,42 +169,156 @@ static Value makeBroadcast(PatternRewriter &b, MemRefType outType, Value inp,
   return inp;
 }
 
+static void printReasoc(llvm::SmallVector<mlir::ReassociationIndices> val, ShapedType input_shape){
+  llvm::errs() << "reasoc = [";
+  for(auto ri : val){
+    llvm::errs() << "[";
+    for(auto i : ri){
+      llvm::errs() << i << ",";
+    }
+    llvm::errs() << "],";
+  }
+  llvm::errs() << "]\n";
+}
+
+static void printMaps(Value value){
+  auto op = value.getDefiningOp();
+  llvm::SmallVector<mlir::AffineMap, 4U> affineMaps;
+  if(auto collapse_op = dyn_cast<memref::CollapseShapeOp>(op)){
+    affineMaps = collapse_op.getReassociationMaps();
+    printReasoc(collapse_op.getReassociationIndices(), collapse_op->getOperand(0).getType().cast<ShapedType>());
+    // llvm::Optional<llvm::SmallVector<mlir::ReassociationIndices>> t = getReassociationIndicesForCollapse(collapse_op->getOperand(0).getType().cast<ShapedType>().getShape(), collapse_op.getType().cast<ShapedType>().getShape());
+  }
+  else if(auto expand_op = dyn_cast<memref::ExpandShapeOp>(op)){
+    affineMaps = expand_op.getReassociationMaps();
+    // printReasoc(expand_op.getReassociationExprs());
+  }
+  else if(auto trOp = dyn_cast<TransformOp>(op)){
+    affineMaps.push_back(trOp.getTransform().getMap().getAffineMap());
+  }
+  else{
+    return;
+  }
+  for(auto map : affineMaps){
+    llvm::errs() << "map = " << compressUnusedSymbols(map) << "\n";
+  }
+}
+
 static Value maybeFindRootViewSource(Value value){
   while (auto viewOp = value.getDefiningOp<ViewLikeOpInterface>()) {
+    llvm::errs() << "\t traversing view ops : " << value << "\n";
+    printMaps(value);
     value = viewOp.getViewSource();
   }
   return value;
 }
 
+
+static TransformOp
+replaceCollapseWithTransformOp(Location loc, PatternRewriter &rewriter, Value value){
+  if(value.getDefiningOp() && dyn_cast<TransformOp>(value.getDefiningOp())){
+    auto trOp = cast<TransformOp>(value.getDefiningOp());
+    return replaceCollapseWithTransformOp(loc, rewriter, trOp.getViewSource());
+  }
+  if(value.getDefiningOp() && dyn_cast<memref::CollapseShapeOp>(value.getDefiningOp())){
+    auto collapseOp = cast<memref::CollapseShapeOp>(value.getDefiningOp());
+    auto inputShape = collapseOp.getViewSource().getType().cast<ShapedType>().getShape();
+    auto outputShape = value.getType().cast<ShapedType>().getShape();
+    llvm::errs() << "outputShape = " << value.getType().cast<ShapedType>() << "\n";
+
+    SmallVector<std::string> inputDimNames;
+    for (int i=0 ; i < inputShape.size(); i++){
+      inputDimNames.push_back("i" + std::to_string(i));
+    }
+
+    // buildUp.unmerge({"a", "b", "c"}, {0, 1, 2}, "a", {2, 3, 4});
+    TopDownTMBuilder collapseShapeBuilder(rewriter, outputShape, loc);
+
+    SmallVector<ReassociationIndices, 4> reassocIndices = collapseOp.getReassociationIndices();
+    assert(reassocIndices.size() == outputShape.size());
+    for(int oIdx=0; oIdx < reassocIndices.size(); oIdx++){
+      ReassociationIndices reassocIdx = reassocIndices[oIdx];
+          llvm::errs() << "reassocIdx size = " << reassocIdx.size() << "\n";
+      SmallVector<StringRef, 4U> upperNames;
+      std::transform(reassocIdx.begin(), reassocIdx.end(), std::back_inserter(upperNames),
+                   [&](int64_t i) { return inputDimNames[i].c_str(); });
+      SmallVector<unsigned int, 4U> upperDims;
+      std::transform(reassocIdx.begin(), reassocIdx.end(), std::back_inserter(upperDims),
+                   [&](int64_t i) { return i; });
+      SmallVector<int64_t, 4U> upperDimSizes;
+      std::transform(reassocIdx.begin(), reassocIdx.end(), std::back_inserter(upperDimSizes),
+                   [&](int64_t i) { return inputShape[i]; });
+      SmallString<8> outName;
+      ("dim" + Twine(oIdx)).toStringRef(outName);        
+      collapseShapeBuilder.merge(upperNames, upperDims, outName, upperDimSizes);
+      // collapseShapeBuilder.unmerge(outName, oIdx, upperNames, upperDimSizes);
+    }
+
+    TransformMapAttr collapseShapeAttr = collapseShapeBuilder.get();
+    llvm::errs() << "collapseOp.getType() = " << collapseOp.getType() << "\n";
+    auto newTrOp = rewriter.replaceOpWithNewOp<TransformOp>(collapseOp, collapseOp.getViewSource(), collapseShapeAttr);
+    llvm::errs() << "TrOp = " << newTrOp << "\n";
+    llvm::errs() << "newTrOp.getType() = " << newTrOp.getType() << "\n";
+
+    if (newTrOp.getViewSource().getDefiningOp<ViewLikeOpInterface>()){
+      return replaceCollapseWithTransformOp(loc, rewriter, collapseOp.getViewSource()); 
+    }
+    else{
+      return newTrOp;
+    }
+  }
+  llvm_unreachable("There is a TransformOp in the chain..");
+}
+
+
 static void insertLoadFromOtherSource(PatternRewriter &b, Location loc,
                                       GlobalStoreOp gemmStoreOp, Value srcOp,
                                       Value dest) {
-  srcOp = maybeFindRootViewSource(srcOp);
-  LLVM_DEBUG(llvm::dbgs() << "Src type: " << srcOp.getType() << " dest type: "
-                          << gemmStoreOp.getDest().getType() << "\n");
-  ArrayRef<int64_t> sType, dType;
-  sType = srcOp.getType().cast<ShapedType>().getShape();
-  dType = gemmStoreOp.getDest().getType().getShape();
-  assert(sType.size() == dType.size() &&
-         "Rank of extra fusion arguments matches shape of C tensor");
+  llvm::errs() << "srcOp1 = " << srcOp << "\n";
+  maybeFindRootViewSource(srcOp);
+  auto originalSrcOp = srcOp;
+
+  srcOp = replaceCollapseWithTransformOp(loc, b, srcOp);
+  maybeFindRootViewSource(originalSrcOp);
+
+  llvm::errs() << "srcOp2 = " << srcOp << "\n";
+  maybeFindRootViewSource(srcOp);
+
+
+  llvm::errs() << "done.\n";
+  ArrayAttr sourceTransformsFromOp;
+  Value source;
+  std::tie(source, sourceTransformsFromOp) = untransform(b, srcOp);
+  llvm::errs() << "transforms = " << sourceTransformsFromOp[0] << "\n";
+  // auto trOp = cast<TransformOp>(sourceTransformsFromOp[0]);
+
+
+
+  // LLVM_DEBUG(llvm::dbgs() << "Src type: " << srcOp.getType() << " dest type: "
+  //                         << gemmStoreOp.getDest().getType() << "\n");
+  // ArrayRef<int64_t> sType, dType;
+  // sType = srcOp.getType().cast<ShapedType>().getShape();
+  // dType = gemmStoreOp.getDest().getType().getShape();
+  // assert(sType.size() == dType.size() &&
+  //        "Rank of extra fusion arguments matches shape of C tensor");
   SmallVector<Value, 6> loadCoord = gemmStoreOp.getDestCoord();
   Value zero = b.createOrFold<arith::ConstantIndexOp>(loc, 0);
-  for (unsigned i = 0; i < sType.size(); i++) {
-    assert((sType[i] == dType[i] || sType[i] == 1) &&
-           "shape of extra fusion arguments matches shape of C tensor or "
-           "broadcastable");
-    // broadcast source.
-    if (sType[i] != dType[i])
-      loadCoord[i] = zero;
-  }
+  // for (unsigned i = 0; i < sType.size(); i++) {
+  //   assert((sType[i] == dType[i] || sType[i] == 1) &&
+  //          "shape of extra fusion arguments matches shape of C tensor or "
+  //          "broadcastable");
+  //   // broadcast source.
+  //   if (sType[i] != dType[i])
+  //     loadCoord[i] = zero;
+  // }
 
   auto writeCLoop = gemmStoreOp->getParentOfType<TransformingForOp>();
   assert(writeCLoop && "global_store must be in a transforming_for");
 
-  // Handle broadcasts introduced during fusion.
-  ArrayAttr sourceTransformsFromOp;
-  Value source;
-  std::tie(source, sourceTransformsFromOp) = untransform(b, srcOp);
+  // // Handle broadcasts introduced during fusion.
+  // ArrayAttr sourceTransformsFromOp;
+  // Value source;
+  // std::tie(source, sourceTransformsFromOp) = untransform(b, srcOp);
 
   int64_t copyLength = gemmStoreOp.getLength().getSExtValue();
   Type destElemType = dest.getType().cast<MemRefType>().getElementType();
@@ -220,6 +333,7 @@ static void insertLoadFromOtherSource(PatternRewriter &b, Location loc,
 
   // If there are no broadcasts, re-use the coordianes for the writeback
   if (sourceTransformsFromOp.empty()) {
+    llvm::errs() << "sourceTransformsFromOp is empty!\n";
     Type typeToLoad = destElemType;
     if (copyLength > 1)
       typeToLoad = VectorType::get({copyLength}, typeToLoad);
@@ -286,21 +400,21 @@ static Value makeTransformingCopyLoop(PatternRewriter &b, GlobalStoreOp storeOp,
 }
 
 Value applyTransforms(PatternRewriter &b, GlobalStoreOp gemmStoreOp, Value inp,
-                      AffineMap inpMap) {
+                      AffineMap inpMap, ArrayRef<int64_t> outShape) {
   Value ret = inp;
   // 0. move all input preceding ops before
-  Operation *pred = gemmStoreOp;
-  while (Operation *op = inp.getDefiningOp()) {
-    assert(isa<memref::ExpandShapeOp>(op) || isa<memref::CollapseShapeOp>(op));
-    op->moveBefore(pred);
-    pred = op;
-    inp = op->getOperand(0);
-  }
+  // Operation *pred = gemmStoreOp;
+  // while (Operation *op = inp.getDefiningOp()) {
+  //   assert(isa<memref::ExpandShapeOp>(op) || isa<memref::CollapseShapeOp>(op));
+  //   op->moveBefore(pred);
+  //   pred = op;
+  //   inp = op->getOperand(0);
+  // }
 
   // 1. insert broadcast op if necessary
   MemRefType outType = gemmStoreOp.getDest().getType();
   std::tie(ret, inpMap) = makeTransposeTransform(b, ret, inpMap);
-  ret = makeBroadcast(b, outType, ret, inpMap);
+  ret = makeBroadcast(b, outShape, ret, inpMap);
 
   // 2. also create global_store from global to regs
   //    TODO(sjw): make sure output buffer writes (means these inputs will be
@@ -388,7 +502,8 @@ static Value reconfigureLAGeneric(PatternRewriter &b,
         newInput = laIn;
       } else {
         // 2.1.1. Align tiling of other inputs
-        newInput = applyTransforms(b, gemmGlobalStore, inp, inpIdxMap);
+        auto laOutShape = laGeneric.outputs()[0].getType().template cast<MemRefType>().getShape();
+        newInput = applyTransforms(b, gemmGlobalStore, inp, inpIdxMap, laOutShape);
       }
       newInputs.push_back(newInput);
       laGenericAMaps.push_back(AffineMap::getMultiDimIdentityMap(
