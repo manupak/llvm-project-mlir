@@ -311,7 +311,7 @@ static Value insertTransposeAndBroadcastTransforms(PatternRewriter &b,
     ArrayRef<int64_t> inpShape = inpType.getShape();
     ArrayRef<int64_t> outShape = outType.getShape();
 
-    uint32_t diff = outShape.size() - inpShape.size();
+    int64_t diff = outShape.size() - inpShape.size();
     LLVM_DEBUG(llvm::dbgs() << "Reached makeBroadcast with map " << inpIdxMap
                             << " and diff = " << diff << "\n");
 
@@ -352,10 +352,11 @@ static Value insertTransposeAndBroadcastTransforms(PatternRewriter &b,
     BottomUpTMBuilder addDimtransform(
         b, inp.getType().cast<ShapedType>().getShape(), loc);
     for (uint32_t i = 0; i < outShape.size(); ++i) {
+      unsigned int startIdx = i - diff;
       if (llvm::is_contained(bcastInDims, i)) {
-        addDimtransform.passThrough({i}, {i - diff});
+        addDimtransform.passThrough({i}, {startIdx});
       } else if (llvm::is_contained(passThroughInDims, i)) {
-        addDimtransform.passThrough({i}, {i - diff});
+        addDimtransform.passThrough({i}, {startIdx});
       } else {
         isDimAdded = true;
         SmallString<8> name;
@@ -541,10 +542,10 @@ static AffineMap findAliasingOutputIdxMap(linalg::GenericOp laGeneric,
 static Value reconfigureLAGeneric(PatternRewriter &b,
                                   linalg::GenericOp laGeneric, Value laIn,
                                   ArrayRef<AffineMap> idxMaps,
-                                  GlobalStoreOp gemmGlobalStore) {
+                                  GlobalStoreOp gemmGlobalStore,
+                                  OpOperand* laGenericInputLeadingToGlobalStore) {
   MLIRContext *ctx = laGeneric.getContext();
   Location loc = laGeneric.getLoc();
-  Value twout = gemmGlobalStore.getDest();
   auto regType = laIn.getType().template cast<MemRefType>();
   auto laOut = b.create<GpuAllocOp>(loc, regType);
 
@@ -557,7 +558,7 @@ static Value reconfigureLAGeneric(PatternRewriter &b,
       AffineMap inpIdxMap = std::get<1>(pair);
       auto outToInMap = inpIdxMap.compose(invertOutIdxMap);
       Value newInput;
-      if (inp == twout) {
+      if (inp == laGenericInputLeadingToGlobalStore->get()) {
         newInput = laIn;
       } else {
         // 2.1.1. Align tiling of other inputs
@@ -586,13 +587,13 @@ static Value reconfigureLAGeneric(PatternRewriter &b,
 }
 
 static LogicalResult findGlobalStore(linalg::GenericOp laGeneric,
-                                     Value &inputLeadingToGlobalStore,
+                                     OpOperand*& inputLeadingToGlobalStore,
                                      GlobalStoreOp &gemmStoreOp) {
   for (auto pair :
-       llvm::zip(laGeneric.inputs(), laGeneric.getIndexingMapsArray())) {
+       llvm::zip(laGeneric.getInputOperands(), laGeneric.getIndexingMapsArray())) {
     AffineMap inpIdxMap = std::get<1>(pair);
-    Value input = std::get<0>(pair);
-    GlobalStoreOp maybeStore = traceToGlobalStore(input);
+    OpOperand* input = std::get<0>(pair);
+    GlobalStoreOp maybeStore = traceToGlobalStore(input->get());
     if (maybeStore) {
       if (gemmStoreOp) {
         LLVM_DEBUG(llvm::dbgs()
@@ -600,7 +601,7 @@ static LogicalResult findGlobalStore(linalg::GenericOp laGeneric,
         return failure();
       }
 
-      auto aliasingOutputMap = findAliasingOutputIdxMap(laGeneric, input);
+      auto aliasingOutputMap = findAliasingOutputIdxMap(laGeneric, input->get());
       AffineMap invertOutIdxMap = inversePermutation(aliasingOutputMap);
       auto outToInMap = inpIdxMap.compose(invertOutIdxMap);
       SmallVector<unsigned> permutedDims;
@@ -614,10 +615,10 @@ static LogicalResult findGlobalStore(linalg::GenericOp laGeneric,
             << "The store is not even a minor identity with broadcasting.\n");
         return failure();
       }
-      auto inpShape = input.getType().cast<ShapedType>().getShape();
+      auto inpShape = input->get().getType().cast<ShapedType>().getShape();
       LLVM_DEBUG(llvm::dbgs() << "outToInMap = " << outToInMap << "\n");
       LLVM_DEBUG(llvm::dbgs() << "inp shape = "
-                              << input.getType().cast<ShapedType>() << "\n");
+                              << input->get().getType().cast<ShapedType>() << "\n");
       LLVM_DEBUG(llvm::dbgs() << "permutedDims = ");
       LLVM_DEBUG(llvm::interleaveComma(permutedDims, llvm::dbgs()));
       LLVM_DEBUG(llvm::dbgs() << "\n");
@@ -638,6 +639,52 @@ static LogicalResult findGlobalStore(linalg::GenericOp laGeneric,
     return failure();
   }
   return success();
+}
+
+//This function will add a TransformingFor to translate original coordinates
+//of the gemmStore op to be transformed to match the aliasing shape of the
+//output. This is done by replacing the original gemmStoreOp with a new one
+//wrapped in a TransformingFor op.
+static void adjustStoreCoordsForDestArg(PatternRewriter &rewriter,
+                                        linalg::GenericOp laGeneric, 
+                                        OpOperand* laGenericInputLeadingToGlobalStore,
+                                        GlobalStoreOp& gemmStoreOp){
+  auto actualLAGenericOut = laGeneric.getOutputOperand(0);
+  auto actualLAGenericOutIdxMap =
+  laGeneric.getTiedIndexingMap(actualLAGenericOut);
+  auto invertAliasingOutIdxMap = inversePermutation(laGeneric.getTiedIndexingMap(laGenericInputLeadingToGlobalStore));
+  auto aliasingOutToActualOutIdxMap = actualLAGenericOutIdxMap.compose(invertAliasingOutIdxMap);
+  auto temp = insertTransposeAndBroadcastTransforms(rewriter, laGenericInputLeadingToGlobalStore->get().getType().cast<MemRefType>(), actualLAGenericOut->get(), aliasingOutToActualOutIdxMap);
+  ArrayAttr sourceTransformsFromOp;
+  Value source;
+  std::tie(source, sourceTransformsFromOp) = untransform(rewriter, temp);
+  ArrayAttr sourceLeftOob = gemmStoreOp.getLeftOobDims();
+  ArrayAttr sourceRightOob = gemmStoreOp.getRightOobDims();
+  std::tie(sourceLeftOob, sourceRightOob) = computeOobFromTransforms(rewriter, sourceTransformsFromOp, {{sourceLeftOob, sourceRightOob}});
+  SmallVector<Value, 6> storeCoord = gemmStoreOp.getDestCoord();
+  SmallVector<int64_t> bounds(storeCoord.size(), 1LL), strides(storeCoord.size(), 1LL);
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(gemmStoreOp);
+    auto copyLoop = rewriter.create<TransformingForOp>(
+    laGeneric->getLoc(), ArrayRef<ValueRange>{storeCoord},
+    ArrayRef<Attribute>{sourceTransformsFromOp},
+    /*bounds=*/ArrayRef<int64_t>(bounds),
+    /*strides=*/ArrayRef<int64_t>(strides), /*forceUnroll=*/true,
+    /*useIndexDiffs=*/true);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(copyLoop.getBody());
+      GlobalStoreOp newGemmStoreOp = static_cast<GlobalStoreOp>(rewriter.clone(*gemmStoreOp));
+      newGemmStoreOp.getDestCoordMutable().assign(copyLoop.getLowerCoords(0));
+      newGemmStoreOp.setLeftOobDimsAttr(sourceLeftOob);
+      newGemmStoreOp.setRightOobDimsAttr(sourceRightOob);
+      newGemmStoreOp.getDestMutable().assign(actualLAGenericOut->get());
+      gemmStoreOp->replaceAllUsesWith(newGemmStoreOp);
+      gemmStoreOp->erase();
+      gemmStoreOp = newGemmStoreOp;
+    }
+  }
 }
 
 LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
@@ -673,7 +720,7 @@ LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
   // 1. Trace input to global_store.
   // 1.1. Find the (implicit) gemm output
   GlobalStoreOp gemmStoreOp;
-  Value laGenericInputLeadingToGlobalStore;
+  OpOperand* laGenericInputLeadingToGlobalStore;
   if (findGlobalStore(laGeneric, laGenericInputLeadingToGlobalStore,
                       gemmStoreOp)
           .failed()) {
@@ -683,15 +730,9 @@ LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
   auto actualLAGenericOutIdxMap =
       laGeneric.getTiedIndexingMap(actualLAGenericOut);
   auto invertOutIdxMap = inversePermutation(actualLAGenericOutIdxMap);
-  if (laGenericInputLeadingToGlobalStore.getType() !=
-      actualLAGenericOut->get().getType()) {
-    LLVM_DEBUG(llvm::dbgs() << "Currently, we assume the shape of gemmStore op "
-                               "and linalg output is the same.\n");
-    LLVM_DEBUG(llvm::dbgs()
-               << "This instance it differs : "
-               << laGenericInputLeadingToGlobalStore.getType() << " vs "
-               << actualLAGenericOut->get().getType() << " .\n");
-    return failure();
+
+  if (laGenericInputLeadingToGlobalStore->get().getType() != actualLAGenericOut->get().getType()) {
+    adjustStoreCoordsForDestArg(b, laGeneric, laGenericInputLeadingToGlobalStore, gemmStoreOp);
   }
 
   SmallVector<AffineMap> idxMaps = laGeneric.getIndexingMapsArray();
@@ -699,7 +740,7 @@ LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
     AffineMap inpIdxMap = std::get<0>(pair);
     auto outToInMap = inpIdxMap.compose(invertOutIdxMap);
     Value inp = std::get<1>(pair);
-    if (inp != laGenericInputLeadingToGlobalStore) {
+    if (inp != laGenericInputLeadingToGlobalStore->get()) {
       SmallVector<unsigned> permutedDims;
       if (!outToInMap.isProjectedPermutation(/*allowZeroInResults=*/true)) {
         LLVM_DEBUG(llvm::dbgs() << outToInMap << "\n");
@@ -738,7 +779,7 @@ LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
 
     // 2.2. Tile linalg.generic with vgpr as input, return output vgprs
     Value laOutRegs =
-        reconfigureLAGeneric(b, laGeneric, fusionSlice, idxMaps, gemmStoreOp);
+        reconfigureLAGeneric(b, laGeneric, fusionSlice, idxMaps, gemmStoreOp, laGenericInputLeadingToGlobalStore);
     // 2.2.0. Move the generic before the write-back. This'll put all
     // the copy loops for other inputs before the generic due to insertion
     // order.

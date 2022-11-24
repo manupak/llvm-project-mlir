@@ -65,7 +65,7 @@ void xmodel::buildGraphPipeline(OpPassManager &pm,
   pm.addNestedPass<func::FuncOp>(tosa::createTosaMakeBroadcastablePass());
   pm.addNestedPass<func::FuncOp>(tosa::createTosaOptionalDecompositions());
   pm.addPass(
-      tosa::createTosaPartition({{"tosa.conv2d", "tosa.depthwise_conv2d"}}));
+      tosa::createTosaPartition({{"tosa.conv2d", "tosa.depthwise_conv2d", "tosa.matmul"}}));
 
   // make async kernel launch's
   /* mlir-opt --xmodel-async-graph
