@@ -22,6 +22,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Rock/IR/Rock.h"
@@ -66,6 +67,13 @@ struct MILARewritePattern : public OpRewritePattern<linalg::GenericOp> {
 
   LogicalResult matchAndRewrite(linalg::GenericOp laGeneric,
                                 PatternRewriter &b) const override;
+};
+
+struct ReduceRewritePattern : public OpRewritePattern<rock::ReduceOp> {
+  using OpRewritePattern<rock::ReduceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(rock::ReduceOp reduceOp,
+                                PatternRewriter &rewriter) const override;
 };
 } // end anonymous namespace
 
@@ -188,7 +196,7 @@ static GlobalStoreOp traceToGlobalStore(Value inp) {
       // ignore
       continue;
     }
-    if (isa<linalg::GenericOp>(use)) {
+    if (isa<linalg::GenericOp>(use) || isa<rock::ReduceOp>(use)) {
       // reader
     } else if (auto store = dyn_cast<GlobalStoreOp>(use)) {
       // Threadwise copy that is already unttransformed (new style)
@@ -444,10 +452,63 @@ static bool isUnfusedKernelStore(rock::GlobalStoreOp store) {
   return ret;
 }
 
+LogicalResult
+ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
+                                      PatternRewriter &rewriter) const {
+  Location loc = reduceOp.getLoc();
+  GlobalStoreOp globalStoreOp = traceToGlobalStore(reduceOp.getIn());
+  if (reduceOp.getReduceMethod() != ReduceMethod::Sum) {
+    return reduceOp.emitError("We only support sum reductions.!");
+  }
+  if (!globalStoreOp) {
+    return reduceOp.emitError(
+        "rock.reduce input is not the global store of the previous op.");
+  }
+  int64_t elementCount = globalStoreOp.getLengthAttr().getInt();
+  Type elementType = globalStoreOp.getSource().getType().getElementType();
+  Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  int64_t reductionAxis = reduceOp.getAxisAttr().getInt();
+  int64_t inpRank = reduceOp.getIn().getType().cast<ShapedType>().getRank();
+  if (elementCount != 1 && reductionAxis == inpRank - 1) {
+    // if the reduction dimension is the last dimension and its a vector.
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(globalStoreOp);
+    VectorType loadedElType = VectorType::get({elementCount}, elementType);
+    Value loadVal = rewriter.create<vector::LoadOp>(
+        loc, loadedElType, globalStoreOp.getSource(),
+        globalStoreOp.getSourceCoord());
+    // TODO(@manupak): change this to a selection once we have more reduction
+    // types
+    Value reducedVal = rewriter.create<vector::ReductionOp>(
+        loc, vector::CombiningKind::ADD, loadVal);
+    Value reduceReg = rewriter.create<GpuAllocOp>(
+        loc, MemRefType::get({1}, elementType, {},
+                             gpu::GPUDialect::getPrivateAddressSpace()));
+    rewriter.create<InBoundsStoreOp>(loc, reducedVal, reduceReg, zero);
+    globalStoreOp.getSourceMutable().assign(reduceReg);
+    globalStoreOp.getSourceCoordMutable().assign(zero);
+    IntegerAttr newLength =
+        rewriter.getIntegerAttr(globalStoreOp.getLengthAttr().getType(), 1);
+    globalStoreOp.setLengthAttr(newLength);
+  }
+  SmallVector<Value, 4> storeCoords = globalStoreOp.getDestCoord();
+  storeCoords[reductionAxis] = zero;
+  globalStoreOp.getDestCoordMutable().assign(storeCoords);
+  // TODO(@manupak): change this to a selection once we have more reduction
+  // types
+  globalStoreOp.setStoreMethodAttr(
+      StoreMethodAttr::get(rewriter.getContext(), StoreMethod::AtomicAdd));
+  globalStoreOp.getDestMutable().assign(reduceOp.getOut());
+  rewriter.eraseOp(reduceOp);
+  rewriter.eraseOp(reduceOp.getIn().getDefiningOp());
+  return success();
+}
+
 void RockLinalgAlignPass::runOnOperation() {
   MLIRContext *ctx = &getContext();
   RewritePatternSet patterns(ctx);
   patterns.add<MILARewritePattern>(ctx);
+  patterns.add<ReduceRewritePattern>(ctx);
   if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))))
     signalPassFailure();
   WalkResult verifyAllStores =
