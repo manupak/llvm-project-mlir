@@ -29,6 +29,7 @@ add_rocmlir_dialect_library(MLIRRockTransforms
   MLIRBufferizationTransforms
   MLIRDialect
   MLIRXModel
+  MLIRXModelTransforms
   MLIRFuncDialect
   MLIRIR
   MLIRPass

@@ -170,6 +170,18 @@ struct MICORewritePattern : public OpRewritePattern<memref::AllocOp> {
           return fail;
         }
         writer = mrop;
+      } else if (auto mrop = dyn_cast<rock::ReduceOp>(useOp)) {
+        // Direct output of a reduction operation
+        if (writer)
+          return fail;
+        if (mrop.getOutArgument()->get() != allocaMem) {
+          LLVM_DEBUG(
+              llvm::dbgs()
+              << "Allocation argument isn't in output position of reduction op"
+              << mrop << "\n");
+          return fail;
+        }
+        writer = mrop;
       } else if (auto mrop = dyn_cast<rock::TransformOp>(useOp)) {
         // 1.2 Input of rock.transform
         if (writer)
