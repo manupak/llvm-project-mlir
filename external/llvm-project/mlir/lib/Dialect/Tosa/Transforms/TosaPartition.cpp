@@ -489,7 +489,7 @@ bool TosaPartitionPass::isLeadingOp(Operation *op) const {
 }
 
 bool TosaPartitionPass::isTrailingOp(Operation *op) const {
-  return isa<tosa::TransposeOp, tosa::ReshapeOp>(op) || isFuseableOp(op);
+  return isa<tosa::TransposeOp, tosa::ReshapeOp, tosa::ReduceSumOp>(op) || isFuseableOp(op);
 }
 
 StringRef TosaPartitionPass::partitionTag() const { return partitionTagOpt; }
@@ -614,7 +614,10 @@ void TosaPartitionPass::runOnOperation() {
               }
               // General case.
               trailingOps.insert(userOp);
-              worklist.push_back(userOp);
+              // Stop the trail after finding a reduction op.
+              if(!isa<tosa::ReduceSumOp>(userOp)){
+                worklist.push_back(userOp);
+              }
               for (Value opnd : userOp->getOperands())
                 if (!resultNodes.contains(opnd) &&
                     !trailingOps.contains(opnd.getDefiningOp()))
