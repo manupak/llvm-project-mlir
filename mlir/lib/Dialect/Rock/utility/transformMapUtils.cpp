@@ -910,6 +910,7 @@ Value mlir::rock::insertTransposeAndBroadcastTransforms(
     ArrayRef<int64_t> inpShape = inpType.getShape();
 
     int64_t diff = outShape.size() - inpShape.size();
+
     LLVM_DEBUG(llvm::dbgs() << "Reached makeBroadcast with map " << inpIdxMap
                             << " and diff = " << diff << "\n");
 
@@ -921,6 +922,7 @@ Value mlir::rock::insertTransposeAndBroadcastTransforms(
       uint32_t newIdx = 0;
       SmallVector<SmallVector<uint32_t>> merges;
       SmallVector<uint32_t> mergeDims;
+      SmallVector<int64_t> collapseShape;
       for (const auto &idxAndValue : llvm::enumerate(inpIdxMap.getResults())) {
         uint32_t idx = idxAndValue.index();
         AffineExpr resultExpr = idxAndValue.value();
@@ -930,6 +932,7 @@ Value mlir::rock::insertTransposeAndBroadcastTransforms(
           diff++;
         } else {
           newInpIdxMap.setResult(newIdx++, resultExpr);
+          collapseShape.push_back(inpShape[idx]);
           merges.push_back(mergeDims);
           mergeDims.clear();
         }
@@ -937,7 +940,7 @@ Value mlir::rock::insertTransposeAndBroadcastTransforms(
       if (mergeDims.size())
         merges.back().append(mergeDims);
 
-      TopDownTMBuilder collapseTransform(b, outShape, loc);
+      TopDownTMBuilder collapseTransform(b, collapseShape, loc);
       for (auto idxAndMerge : llvm::enumerate(merges)) {
         uint32_t idx = idxAndMerge.index();
         auto merge = idxAndMerge.value();

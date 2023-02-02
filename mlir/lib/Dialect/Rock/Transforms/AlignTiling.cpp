@@ -196,7 +196,7 @@ static GlobalStoreOp traceToGlobalStore(Value inp) {
       // ignore
       continue;
     }
-    if (isa<linalg::GenericOp>(use) || isa<rock::ReduceOp>(use)) {
+    if (isa<linalg::GenericOp>(use) || isa<rock::ReduceOp>(use) || isa<ViewLikeOpInterface>(use)) {
       // reader
     } else if (auto store = dyn_cast<GlobalStoreOp>(use)) {
       // Threadwise copy that is already unttransformed (new style)
@@ -382,7 +382,7 @@ LogicalResult MILARewritePattern::matchAndRewrite(linalg::GenericOp laGeneric,
     Value inp = std::get<1>(pair);
     if (inp != laGenericInputLeadingToGlobalStore) {
       SmallVector<unsigned> permutedDims;
-      if (!outToInMap.isProjectedPermutation(/*allowZeroInResults=*/true)) {
+      if (!outToInMap.isPermutationOfMinorIdentityWithBroadcasting(permutedDims)) {
         LLVM_DEBUG(llvm::dbgs() << outToInMap << "\n");
         LLVM_DEBUG(llvm::dbgs() << "^ is not a isProjectedPermutation from "
                                    "output coords to fusion input\n");
@@ -456,19 +456,23 @@ LogicalResult
 ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
                                       PatternRewriter &rewriter) const {
   Location loc = reduceOp.getLoc();
-  GlobalStoreOp globalStoreOp = traceToGlobalStore(reduceOp.getIn());
-  if (reduceOp.getReduceMethod() != ReduceMethod::Sum) {
+  int64_t reductionAxis = reduceOp.getAxisAttr().getInt();
+  Value reduceIn = reduceOp.getIn();
+  Value reduceOut = reduceOp.getOut();
+  ReduceMethod rMethod = reduceOp.getReduceMethod();
+
+  GlobalStoreOp globalStoreOp = traceToGlobalStore(reduceIn);
+  if (rMethod != ReduceMethod::Sum) {
     return reduceOp.emitError("We only support sum reductions.!");
   }
   if (!globalStoreOp) {
-    return reduceOp.emitError(
-        "rock.reduce input is not the global store of the previous op.");
+    LLVM_DEBUG(llvm::dbgs() << "Match failure: reduction is not tracing to the global store\n");
+    return failure();
   }
   int64_t elementCount = globalStoreOp.getLengthAttr().getInt();
   Type elementType = globalStoreOp.getSource().getType().getElementType();
   Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-  int64_t reductionAxis = reduceOp.getAxisAttr().getInt();
-  int64_t inpRank = reduceOp.getIn().getType().cast<ShapedType>().getRank();
+  int64_t inpRank = reduceIn.getType().cast<ShapedType>().getRank();
   if (elementCount != 1 && reductionAxis == inpRank - 1) {
     // if the reduction dimension is the last dimension and its a vector.
     OpBuilder::InsertionGuard guard(rewriter);
@@ -498,9 +502,9 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
   // types
   globalStoreOp.setStoreMethodAttr(
       StoreMethodAttr::get(rewriter.getContext(), StoreMethod::AtomicAdd));
-  globalStoreOp.getDestMutable().assign(reduceOp.getOut());
+  globalStoreOp.getDestMutable().assign(reduceOut);
   rewriter.eraseOp(reduceOp);
-  rewriter.eraseOp(reduceOp.getIn().getDefiningOp());
+  rewriter.eraseOp(reduceIn.getDefiningOp());
   return success();
 }
 

@@ -42,6 +42,69 @@ using namespace mlir::rock;
 
 namespace {
 
+
+// Rewrite ReduceOp source views
+struct ReduceInputBufferRewritePattern
+    : public OpRewritePattern<ReduceOp> {
+  using OpRewritePattern<ReduceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReduceOp reduceOp,
+                                PatternRewriter &rewriter) const override;
+};
+
+static LogicalResult traceAlloca(Value source, memref::AllocOp& originalAllocOp){
+  if(ViewLikeOpInterface viewOp = source.getDefiningOp<ViewLikeOpInterface>()){
+    return traceAlloca(viewOp.getViewSource(), originalAllocOp);
+  }
+  else if(memref::AllocOp allocOp = source.getDefiningOp<memref::AllocOp>()){
+    originalAllocOp = allocOp;
+    return success();
+  }
+  else{
+    return failure();
+  }
+}
+
+static LogicalResult replaceAlloca(PatternRewriter &rewriter, Value source, Value newSource){
+  if(memref::ExpandShapeOp expandOp = source.getDefiningOp<memref::ExpandShapeOp>()){
+    newSource = rewriter.create<memref::CollapseShapeOp>(
+                   expandOp.getLoc(),
+                   expandOp->getOperand(0).getType(), newSource,
+                   expandOp.getReassociation());
+    return replaceAlloca(rewriter, expandOp.getViewSource(), newSource);
+  }
+  else if(memref::CollapseShapeOp collapseOp = source.getDefiningOp<memref::CollapseShapeOp>()){
+    newSource = rewriter.create<memref::ExpandShapeOp>(
+                   collapseOp.getLoc(),
+                   collapseOp->getOperand(0).getType(), newSource,
+                   collapseOp.getReassociation());
+    return replaceAlloca(rewriter, collapseOp.getViewSource(), newSource);
+  }
+  else if(memref::AllocOp allocOp = source.getDefiningOp<memref::AllocOp>()){
+    rewriter.replaceOp(allocOp, newSource);
+    return success();
+  }
+  else{
+    return failure();
+  }
+}
+
+
+LogicalResult ReduceInputBufferRewritePattern::matchAndRewrite(ReduceOp reduceOp, PatternRewriter &rewriter) const {
+  if(memref::AllocOp allocOp = reduceOp.getIn().getDefiningOp<memref::AllocOp>()){
+    return failure();
+  }
+  memref::AllocOp originalAllocOp;
+  if(traceAlloca(reduceOp.getIn(), originalAllocOp).failed()){
+    return failure();
+  }
+  PatternRewriter::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointAfterValue(originalAllocOp);
+  MemRefType newAllocType = MemRefType::get(reduceOp.getIn().getType().cast<ShapedType>().getShape(), reduceOp.getIn().getType().getElementType());
+  memref::AllocOp newAlloca = rewriter.create<memref::AllocOp>(reduceOp.getLoc(), newAllocType);
+  return replaceAlloca(rewriter, reduceOp.getIn(), newAlloca.getResult());
+}
+
 // This rewrite will rewrite the linalg IO that has view like-ops surrounding
 // them to be consumed by the linalg operation itself adjusting the indexing
 // maps to faithfully represent them.
@@ -434,7 +497,8 @@ void RockFoldTransposePass::runOnOperation() {
   }
 
   RewritePatternSet patternsTP(ctx);
-  patternsTP.add<RemoveTrivialTransposePattern,
+  patternsTP.add<ReduceInputBufferRewritePattern,
+                 RemoveTrivialTransposePattern,
                  InlineViewLikeOperandsLinalgRewritePattern,
                  FoldRockOutputTransforms>(ctx);
   if (failed(
