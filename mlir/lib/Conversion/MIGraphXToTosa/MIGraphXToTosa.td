@@ -45,5 +45,9 @@ def : Pat<(MIGraphX_TransposeOp $input1, $permAttr),
   (Tosa_TransposeOp $input1, (Arith_ConstantOp (ConvertI64ArrayAttrtoDenseElementsAttr $permAttr)))>;
 
 def : Pat<(MIGraphX_ReshapeOp $input1, $newshape), (Tosa_ReshapeOp $input1, $newshape)>;
+def ConvertI64ArrayAttrToI64Attr : NativeCodeCall<
+  "$0.getValue()[0]"
+>;
+def : Pat<(MIGraphX_ReduceSumOp $input1, $axes), (Tosa_ReduceSumOp $input1, (ConvertI64ArrayAttrToI64Attr $axes))>;
 
 #endif // MLIR_CONVERSION_MIGRAPHX_TO_TOSA

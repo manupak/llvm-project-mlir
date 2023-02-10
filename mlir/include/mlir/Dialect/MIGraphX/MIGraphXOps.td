@@ -305,6 +305,19 @@ def MIGraphX_ReshapeOp :
   let assemblyFormat = "`(`$input`)` attr-dict `:` `(`type($input)`)` `->` type($output)";
 }
 
+def MIGraphX_ReduceSumOp :
+    MIGraphX_Op<"reduce_sum">,
+    Arguments<(ins AnyRankedTensor:$input,
+                   I64ArrayAttr:$axes
+                   )>,
+	Results<(outs AnyRankedTensor:$output)> {
+  let summary = "reduce sum a tensor";
+  let description = [{
+    The `migraphx.reduce_sum` op.
+  }];
+  let assemblyFormat = "`(`$input`)` attr-dict `:` `(`type($input)`)` `->` type($output)";
+}
+
 def MIGraphX_BroadcastOp :
     MIGraphX_Op<"broadcast">,
     Arguments<(ins AnyRankedTensor:$input,
