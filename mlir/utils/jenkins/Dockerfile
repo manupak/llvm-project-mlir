@@ -1,10 +1,10 @@
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 MAINTAINER Zhuoran Yin <zhuoran.yin@amd.com>
 
-ARG ROCM_DEB_REPO=http://repo.radeon.com/rocm/apt/5.4.2/
-ARG ROCM_BUILD_NAME=focal
+ARG ROCM_DEB_REPO=http://repo.radeon.com/rocm/apt/5.4.3/
+ARG ROCM_BUILD_NAME=jammy
 ARG ROCM_BUILD_NUM=main
-ARG ROCM_PATH=/opt/rocm-5.4.2
+ARG ROCM_PATH=/opt/rocm-5.4.3
 
 ENV DEBIAN_FRONTEND noninteractive
 
@@ -23,7 +23,7 @@ RUN echo 'install build dependencies'; \
         ccache \
         python3 python3-psutil \
         python3-pip python3-setuptools \
-        swig python3-dev libedit-dev libncurses5-dev libxml2-dev liblzma-dev golang rsync jq;
+        swig python3-dev libedit-dev libncurses5-dev libxml2-dev libxslt1-dev liblzma-dev golang rsync jq;
 
 RUN apt-get update ;\
     apt-get upgrade -y ;\
@@ -69,9 +69,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   software-properties-common
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-           python3.8 python3.8-dev python3.8-venv python3-psutil \
+           python3.10 python3.10-dev python3.10-venv python3-psutil \
            python3-pip python3-setuptools \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 10 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 10 \
     && apt upgrade -y \
     && python3 -m pip install --upgrade pip \
     && pip3 install pandas numpy scipy jinja2 tomli \
@@ -80,24 +80,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Has a copy of the requirements.txt install bit for the new python version
 
 # Need "render" group because some CI hosts have /dev/kfd under it.
-RUN groupadd -g 109 render
+# for 22.04 render gid is 110
+RUN groupadd -g 110 render
 
 # Add ROCm build distribution
 RUN wget --no-check-certificate -qO - http://repo.radeon.com/rocm/rocm.gpg.key 2>/dev/null | apt-key add -
 RUN echo "deb [arch=amd64] $ROCM_DEB_REPO $ROCM_BUILD_NAME $ROCM_BUILD_NUM" > /etc/apt/sources.list.d/rocm.list
+RUN echo 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' > /etc/apt/preferences.d/rocm-pin-600
 
 # Install cmake distribution
 RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | \
     tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
-RUN echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ focal main' | \
+RUN echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' | \
     tee /etc/apt/sources.list.d/kitware.list >/dev/null
 
 # Note instead of installing the latest, we should always manually bump cmake version when necessary.
 # This make sure that we don't accidentally use newer cmake features incompatible with our client.
 # As of 2022-08-17, the rocm/rock images has /opt/conda/bin/cmake at 3.22.1, so we'll match that.
 # Note that the mlir minimum is 3.18.
-RUN apt-get update && rm /usr/share/keyrings/kitware-archive-keyring.gpg && \
-  apt-get install -y --no-install-recommends \
+
+RUN apt-get update && \
+  apt-get install -y \
   rocm-dev \
   rocminfo \
   rocprofiler-dev \
@@ -110,9 +113,8 @@ RUN apt-get update && rm /usr/share/keyrings/kitware-archive-keyring.gpg && \
   kmod \
   file \
   netcat-openbsd \
-  cmake-data=3.22.1-0kitware1ubuntu20.04.1 \
-  cmake=3.22.1-0kitware1ubuntu20.04.1 \
-  kitware-archive-keyring \
+  cmake-data \
+  cmake \
   libsqlite3-dev \
   parallel && \
   apt-get clean && \
@@ -123,7 +125,6 @@ WORKDIR /MIOpenDepsWork
 RUN wget https://raw.githubusercontent.com/ROCmSoftwarePlatform/MIOpen/develop/requirements.txt \
     && wget https://raw.githubusercontent.com/ROCmSoftwarePlatform/MIOpen/develop/install_deps.cmake \
     && sed -i -e '/rocMLIR/d' requirements.txt \
-    && sed -i -e '/composable_kernel/d' requirements.txt \
     && cmake -P install_deps.cmake --prefix /usr/local
 RUN echo $(git ls-remote https://github.com/ROCmSoftwarePlatform/MIOpen HEAD) > miopen-deps-commit-hash
 WORKDIR /
