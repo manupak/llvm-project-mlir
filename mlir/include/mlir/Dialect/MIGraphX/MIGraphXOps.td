@@ -102,6 +102,17 @@ def MIGraphX_TanhOp :
   let assemblyFormat = "`(`$inA`)` attr-dict `:` `(`type($inA)`)` `->` type($output)";
 }
 
+def MIGraphX_ErfOp :
+    MIGraphX_Op<"erf">,
+    Arguments<(ins TensorOf<[F32, F16]>:$inA)>,
+	  Results<(outs TensorOf<[F32, F16]>:$output)> {
+  let summary = "The error function";
+  let description = [{
+    Computes the Gauss error function
+  }];
+  let assemblyFormat = "`(`$inA`)` attr-dict `:` `(`type($inA)`)` `->` type($output)";
+}
+
 def MIGraphX_RecipOp :
     MIGraphX_Op<"recip">,
     Arguments<(ins AnyRankedTensor:$inA)>,

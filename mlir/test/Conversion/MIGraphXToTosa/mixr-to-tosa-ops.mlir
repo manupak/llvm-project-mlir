@@ -234,6 +234,13 @@ module  {
     return %0 : tensor<1x12x100x64xf32>
   }
 
+  // CHECK-LABEL: func.func @func_erf_f32
+  // CHECK: tosa.select
+  func.func @func_erf_f32(%arg0: tensor<5x5xf32>) -> tensor<5x5xf32> attributes{kernel, arch = ""} {
+    %0 = "migraphx.erf"(%arg0) : (tensor<5x5xf32>) -> tensor<5x5xf32>
+    return %0 : tensor<5x5xf32>
+  }
+
 
 }
 

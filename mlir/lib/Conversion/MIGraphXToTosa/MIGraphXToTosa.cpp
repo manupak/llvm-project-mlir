@@ -597,6 +597,140 @@ public:
     return success();
   }
 };
+
+static Value createPolynomial(ConversionPatternRewriter &rewriter, Location loc, TypedValue<TensorType> x, ArrayRef<float> coefficients){
+  Type elementType = x.getType().getElementType();
+  Type tensorType = x.getType();
+  SmallVector<Attribute> coefficientsAttr;
+  for (float coefficient : coefficients){
+    coefficientsAttr.push_back(rewriter.getFloatAttr(elementType, coefficient));
+  }
+  Value polynomial = rewriter.create<tosa::ConstOp>(loc, tensorType, DenseElementsAttr::get(tensorType, {coefficientsAttr[0]}));
+  for (size_t i = 1; i < coefficientsAttr.size(); i++){
+    polynomial = rewriter.create<tosa::MulOp>(loc, tensorType, x, polynomial, /*shift=*/0);
+    Value coeff = rewriter.create<tosa::ConstOp>(loc, tensorType, DenseElementsAttr::get(tensorType, {coefficientsAttr[i]}));
+    polynomial = rewriter.create<tosa::AddOp>(loc, tensorType, polynomial, coeff);
+  }
+  return polynomial;
+}
+
+static Value createHLOApproximation(migraphx::ErfOp op, ConversionPatternRewriter &rewriter){
+  TypedValue<TensorType> input = op.getInA();
+  Location loc = op.getLoc();
+  Type elementType = input.getType().getElementType();
+  // The numerical approximation is for F32.
+  if(elementType.isF16()){
+    input = rewriter.create<tosa::CastOp>(loc, op.getType().clone(rewriter.getF32Type()), input);
+  }
+  // Clamp argument between -4 and 4
+  input = rewriter.create<tosa::ClampOp>(loc, input.getType(), input, rewriter.getI64IntegerAttr(-4), rewriter.getI64IntegerAttr(4), 
+                                                rewriter.getF32FloatAttr(-4.0), rewriter.getF32FloatAttr(4.0));
+  // x^2
+  Value inSquare = rewriter.create<tosa::MulOp>(loc, input.getType(), input, input, /*shift=*/0);
+  // erf(x) = x * Alpha(x^2) / Beta(x^2). 
+  SmallVector<float, 7> alphaCoeffs {-2.72614225801306e-10f, 2.77068142495902e-08f,  -2.10102402082508e-06f,
+    -5.69250639462346e-05f, -7.34990630326855e-04f, -2.95459980854025e-03f,
+    -1.60960333262415e-02f};
+  Value alphaPoly = createPolynomial(rewriter, loc, inSquare, alphaCoeffs);
+
+  // x * Alpha(x^2)
+  Value mulAlphaPoly = rewriter.create<tosa::MulOp>(loc, input.getType(), input, alphaPoly, /*shift=*/0);
+  // 1 / Beta(x^2)
+  SmallVector<float, 7> betaCoeffs {
+    -1.45660718464996e-05f, -2.13374055278905e-04f, -1.68282697438203e-03f,
+    -7.37332916720468e-03f, -1.42647390514189e-02f,
+  };
+  Value betaPoly = createPolynomial(rewriter, loc, inSquare, betaCoeffs);
+  Value betaRecip = rewriter.create<tosa::ReciprocalOp>(loc, input.getType(), betaPoly);
+  // x * Alpha(x^2) / Beta(x^2)
+  Value output = rewriter.create<tosa::MulOp>(loc, input.getType(), mulAlphaPoly, betaRecip, /*shift=*/0);
+  // Clamp output between -1 and 1
+  output = rewriter.create<tosa::ClampOp>(loc, output.getType(), output, rewriter.getI64IntegerAttr(-1), rewriter.getI64IntegerAttr(1), 
+                                                rewriter.getF32FloatAttr(-1.0), rewriter.getF32FloatAttr(1.0));
+  // If it was F16, need to revert back to F16
+  if(elementType.isF16()){
+    output = rewriter.create<tosa::CastOp>(loc, op.getType().clone(rewriter.getF16Type()), output);
+  }
+  return output;
+}
+
+static Value createTosaFloatConst(Location loc, TensorType type, float value, ConversionPatternRewriter &rewriter){
+  Attribute attr = rewriter.getFloatAttr(rewriter.getF32Type(), value);
+  return rewriter.create<tosa::ConstOp>(loc, type, DenseElementsAttr::get(type, {attr}));
+}
+
+// Using:
+// https://en.wikipedia.org/wiki/Error_function#Numerical_approximations with
+// maximum error as 5 x 10^-4 where a1 = 0.278393, a2 = 0.230389, a3 =
+// 0.000972, a4 = 0.078108.
+//
+// Erf = 1 - 1 / (1 + a1X + a2X + a3X + a4X)^4
+static Value createAbramowitzStegunApproximation(migraphx::ErfOp op, ConversionPatternRewriter &rewriter){
+  TypedValue<TensorType> input = op.getInA();
+  Location loc = op.getLoc();
+  Type elementType = input.getType().getElementType();
+  // The numerical approximation is for F32.
+  if(elementType.isF16()){
+    input = rewriter.create<tosa::CastOp>(loc, op.getType().clone(rewriter.getF32Type()), input);
+  }
+
+  auto outType = input.getType();
+  auto absX = rewriter.create<tosa::AbsOp>(loc, outType, input);
+  auto zero = createTosaFloatConst(loc, outType, 0.0, rewriter);
+  auto one = createTosaFloatConst(loc, outType, 1.0, rewriter);
+
+  auto a1 = createTosaFloatConst(loc, outType, 0.278393, rewriter);
+  auto a1X = rewriter.create<tosa::MulOp>(loc, outType, a1, absX, /*shift=*/0);
+  auto sum = rewriter.create<tosa::AddOp>(loc, outType, a1X, one);
+
+  auto a2 = createTosaFloatConst(loc, outType, 0.230389, rewriter);
+  auto x2 = rewriter.create<tosa::MulOp>(loc, outType, absX, absX, /*shift=*/0);
+  auto a2X = rewriter.create<tosa::MulOp>(loc, outType, a2, x2, /*shift=*/0);
+  sum = rewriter.create<tosa::AddOp>(loc, outType, sum, a2X);
+
+  auto a3 = createTosaFloatConst(loc, outType, 0.000972, rewriter);
+  auto x3 = rewriter.create<tosa::MulOp>(loc, outType, x2, absX, /*shift=*/0);
+  auto a3X = rewriter.create<tosa::MulOp>(loc, outType, a3, x3, /*shift=*/0);
+  sum = rewriter.create<tosa::AddOp>(loc, outType, sum, a3X);
+
+  auto a4 = createTosaFloatConst(loc, outType, 0.078108, rewriter);
+  auto x4 = rewriter.create<tosa::MulOp>(loc, outType, x3, absX, /*shift=*/0);
+  auto a4X = rewriter.create<tosa::MulOp>(loc, outType, a4, x4, /*shift=*/0);
+  sum = rewriter.create<tosa::AddOp>(loc, outType, sum, a4X);
+
+  auto rcprl = rewriter.create<tosa::ReciprocalOp>(loc, outType, sum);
+  auto rcprl2 =
+      rewriter.create<tosa::MulOp>(loc, outType, rcprl, rcprl, /*shift=*/0);
+  auto rcprl4 =
+      rewriter.create<tosa::MulOp>(loc, outType, rcprl2, rcprl2, /*shift=*/0);
+  auto erf = rewriter.create<tosa::SubOp>(loc, outType, one, rcprl4);
+
+  // Deal with negative x.
+  auto cond = rewriter.create<tosa::GreaterEqualOp>(
+      loc,
+      RankedTensorType::get(outType.getShape(), rewriter.getIntegerType(1)), input,
+      zero);
+  auto negateErf = rewriter.create<tosa::NegateOp>(loc, outType, erf);
+  Value output = rewriter.create<tosa::SelectOp>(loc, outType, cond, erf, negateErf);
+
+  if(elementType.isF16()){
+    output = rewriter.create<tosa::CastOp>(loc, op.getType().clone(rewriter.getF16Type()), output);
+  }
+  return output;
+}
+
+class ErfConverter final
+    : public OpConversionPattern<migraphx::ErfOp> {
+public:
+  using OpConversionPattern<migraphx::ErfOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(migraphx::ErfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    Value output = createHLOApproximation(op, rewriter);
+    rewriter.replaceOp(op, {output});
+    return success();
+  }
+};
 } // namespace
 
 void migraphx::populateMIGraphXToTosaConversionPatterns(
@@ -605,6 +739,6 @@ void migraphx::populateMIGraphXToTosaConversionPatterns(
       .add<ConvConverter<ConvolutionOp>, ConvConverter<QuantConvolutionOp>,
            BroadcastConverter, MultiBroadcastConverter, ReshapeConverter,
            SoftmaxConverter, DotConverter, ReduceMeanConverter,
-           QuantizeLinearConverter, DeQuantizeLinearConverter, SliceConverter>(
+           QuantizeLinearConverter, DeQuantizeLinearConverter, SliceConverter, ErfConverter>(
           context);
 }

@@ -72,9 +72,11 @@ void mlirGetKernelInfo(MlirModule module, int *size, void *data) {
 MLIR_CAPI_EXPORTED void mlirGetKernelAttrs(MlirModule module, uint32_t *attrs) {
   auto mod = unwrap(module);
   mod.walk([&](mlir::LLVM::LLVMFuncOp llvmFunc) {
-    attrs[0] =
-        llvmFunc->getAttrOfType<mlir::IntegerAttr>("block_size").getInt();
-    attrs[1] = llvmFunc->getAttrOfType<mlir::IntegerAttr>("grid_size").getInt();
+    if(llvmFunc->hasAttr("gpu.kernel")){
+      attrs[0] =
+          llvmFunc->getAttrOfType<mlir::IntegerAttr>("block_size").getInt();
+      attrs[1] = llvmFunc->getAttrOfType<mlir::IntegerAttr>("grid_size").getInt();
+    }
   });
 }
 
