@@ -1703,6 +1703,35 @@ LogicalResult ReduceOp::verify() {
   return success();
 }
 
+//===-----------------------------------------------------===//
+// Blockwise_ReduceOp
+//===-----------------------------------------------------===//
+
+LogicalResult BlockwiseReduceOp::verify() {
+  TransformMapAttr inputView = getInputRegViewAttr();
+  ArrayRef<llvm::StringRef> upperNames = inputView.getOps()[0].getUpperNames();
+  // We expect the view of the register as part of the all tensor to be:
+  // {d0, ... , dn, tid} where d are dimensions of original tensor to
+  // {D0, ... , Dn} of the full tensor. dx is the subset of Dx dimension
+  // within a thread.
+  if(upperNames.size() < 1 || upperNames.back() != "tid"){
+    return emitError("The thread view shape has to be { ... , tid }");
+  }
+  TypedValue<MemRefType> workspaceBuffer = getWorkspaceBuffer();
+  ArrayRef<int64_t> workspaceBufferShape = workspaceBuffer.getType().getShape();
+  if(llvm::any_of(llvm::zip(workspaceBufferShape, inputView.getUpperBounds().asArrayRef()), [](std::tuple<int64_t, int64_t> pair){
+    auto [wsDim, inDim] = pair;
+    if(wsDim != inDim){
+      return false;
+    }
+    return true;
+  }
+  )){
+    return emitError("The shapes of virtual input tensor and workspace buffer needs to match.");
+  }
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // TableGen'd op method definitions
 //===----------------------------------------------------------------------===//

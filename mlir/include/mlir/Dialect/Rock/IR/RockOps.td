@@ -1144,6 +1144,40 @@ def Rock_BlockwiseGemmAccelOp:
   }];
 }
 
+// blockwise_reduction
+def Rock_BlockwiseReduceOp:
+    Rock_Op<"blockwise_reduce">,
+    Arguments<(ins MemRefOf<AccelResTypes>:$input,
+                   MemRefOf<LdsBufferTypes>:$workspace_buffer,
+                   MemRefOf<AccelResTypes>:$output,
+                   IndexAttr:$axis,
+                   ReduceMethodAttr:$reduceMethod,
+                   Rock_TransformMapAttr:$inputRegView,
+                   Rock_TransformMapAttr:$outputRegView,
+                   I32Attr:$blockSize,
+                   I32Attr:$gridSize
+                   )> {
+  let summary = "Blockwise reduce operation";
+  let description = [{
+    The `rock.blockwise_reduce` op does reduce at a blockwise level.
+
+    $input tensor resides in registers in threads.
+    This is supplemented with $inputRegView view that provides a threadwise 
+    view of input tensor.
+
+    $output tensor resides in registers in threads.
+    This is supplemented with $outputRegView view that provides a threadwise 
+    view of output tensor. This could be broadcasted depending on what user wants to do.
+
+    $workspace_buffer resides in LDS. This should have the shape of the input tensor.
+  }];
+  let assemblyFormat = [{
+    $reduceMethod $input `into` $output `using` $workspace_buffer attr-dict `:` type($input) `using` type($workspace_buffer) `into` type($output)
+  }];
+
+  let hasVerifier = 1;
+}
+
 // threadwise_gemm
 def Rock_ThreadwiseGemmOp:
     Rock_Op<"threadwise_gemm",
