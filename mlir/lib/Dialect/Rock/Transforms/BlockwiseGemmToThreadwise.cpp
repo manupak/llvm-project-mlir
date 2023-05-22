@@ -34,6 +34,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -375,13 +376,12 @@ struct BlockwiseReduceRewritePattern
   // nrtid = tid / product(non-reduction dims) is a reduction subgroup leader.
   // rtid = tid % product(non-reduction dims) is thread idx within a reduction subgroup.
   // | rtid | is the number of threads that'd participate in a reduction
-
   ArrayAttr createThreadViewforNRSmallerThanThreads(Location loc,
                                                     ArrayRef<int64_t> toReduceShape,
                                                     int64_t blockSize,
                                                     int64_t reduceAxis,
                                                     PatternRewriter &rewriter
-                                                    ){
+                                                    ) const {
     BottomUpTMBuilder threadsToTensor(rewriter, toReduceShape, loc);
     SmallVector<StringRef, 4> lowerNameRefs;
     threadsToTensor.getStartNames(lowerNameRefs);
@@ -418,10 +418,118 @@ struct BlockwiseReduceRewritePattern
     return rewriter.getArrayAttr({unmergeTrMap, padTrMap, mergeTrMap}); 
   }
 
+  // This function appends a coordinate mapping to point to zero'th index where
+  // it was reduced in the LDS.
+  ArrayAttr appendReducedDimView(Location loc, 
+                                 TransformMapAttr regToInputTensorView, 
+                                 int64_t axis,
+                                 PatternRewriter &rewriter) const {
+    ArrayRef<int64_t> toReduceShape = regToInputTensorView.getLowerBounds().asArrayRef();
+    BottomUpTMBuilder threadsToTensor(rewriter, toReduceShape, loc);
+    for (uint32_t i = 0; i < toReduceShape.size(); ++i) {
+      if(i == axis){
+        threadsToTensor.broadcast({i}, {toReduceShape[i]});
+      }
+      else{
+        threadsToTensor.passThrough({i}, {i});
+      }
+    }
+    SmallVector<Attribute> regToInputTensorViewTrs {regToInputTensorView.getOps()};
+    for(Attribute trMap : threadsToTensor.get().getOps()){
+      regToInputTensorViewTrs.push_back(trMap);
+    }
+    return rewriter.getArrayAttr(regToInputTensorViewTrs);
+  }
+
+  arith::ConstantOp getReductionInitValue(BlockwiseReduceOp op, ConversionPatternRewriter &rewriter) const{
+    ReduceMethod rMethod = op.getReduceMethod();
+    Attribute initValAttr;
+    Type elementType = op.getInput().getType().getElementType();
+    if(elementType.isIntOrIndex()){
+      int64_t initVal;
+      if(rMethod == ReduceMethod::Sum){
+        initVal = 0;
+      }
+      else {
+        // Op verifier gurantees this.
+        assert(rMethod == ReduceMethod::Max);
+        initVal = std::numeric_limits<int64_t>::min();
+      }
+      initValAttr = rewriter.getIntegerAttr(elementType, initVal);
+    }
+    else{
+      double initVal;
+      if(rMethod == ReduceMethod::Sum){
+        initVal = 0.0;
+      }
+      else {
+        // Op verifier gurantees this.
+        assert(rMethod == ReduceMethod::Max);
+        initVal = std::numeric_limits<double>::min();
+      }
+      initValAttr = rewriter.getFloatAttr(elementType, initVal);
+    }
+    return rewriter.create<arith::ConstantOp>(op.getLoc(), elementType, initValAttr);
+  }
+
+  Value createReducingOp(BlockwiseReduceOp op, 
+                                 Value input, 
+                                 Value acc, 
+                                 ConversionPatternRewriter &rewriter) const {
+    ReduceMethod rMethod = op.getReduceMethod();
+    Location loc = op.getLoc();
+    Value zeroConstantOp = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    // Value loadAcc = rewriter.create<InBoundsLoadOp>(loc, input.getType(), acc, zeroConstantOp);
+    Type elementType = op.getInput().getType().getElementType();
+
+    if(!acc.isa<VectorType>() && input.isa<VectorType>()){
+      // This means accumulator is a scalar type and input is a vector type, 
+      // therefore its a elementwise reduction between two operands.
+      vector::CombiningKind kind;
+      if(rMethod == ReduceMethod::Sum){
+        kind = vector::CombiningKind::ADD;
+      }
+      else{
+        // Op verifier gurantees this.
+        assert(rMethod == ReduceMethod::Max);
+        if(elementType.isIntOrIndex()){
+          kind = vector::CombiningKind::MAXF;
+        }
+        else{
+          kind = vector::CombiningKind::MAXF;
+        }
+      }
+      input = rewriter.create<vector::ReductionOp>(loc, kind, input);
+    }
+
+    if(rMethod == ReduceMethod::Sum){
+      Value reduced;
+      if(elementType.isIntOrIndex()){
+        reduced = rewriter.create<arith::AddIOp>(loc, acc, input);
+      }
+      else{
+        reduced = rewriter.create<arith::AddFOp>(loc, acc, input);
+      }
+      return reduced;
+    }
+    else {
+      assert(rMethod == ReduceMethod::Max);
+      Value reduced;
+      if(elementType.isIntOrIndex()){
+        reduced = rewriter.create<arith::MaxSIOp>(loc, acc, input);
+      }
+      else{
+        reduced = rewriter.create<arith::MaxFOp>(loc, acc, input);
+      }
+      return reduced;
+    }
+  }
+
   LogicalResult matchAndRewrite(BlockwiseReduceOp op,
                                 BlockwiseReduceOpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+    // inputView should be register {{coords}, tid} to virtual tensor coords transforms.
     TransformMapAttr inputView = op.getInputRegViewAttr();
     TypedValue<MemRefType> inputReg = op.getInput();
     ArrayRef<int64_t> regShape = inputReg.getType().getShape();
@@ -438,7 +546,7 @@ struct BlockwiseReduceRewritePattern
         rewriter.create<WorkitemIdOp>(loc, rewriter.getIndexType());
 
     // Create strides and bounds to iterate the virtual tensor
-    TransformAttr upperTr = inputView.getOps()[0];
+    TransformAttr upperTr = inputView.getOps().back();
     SmallVector<int64_t, 4> regTensorShape;
     std::transform(upperTr.getUpperDims().begin(), 
                    upperTr.getUpperDims().end(), 
@@ -449,8 +557,8 @@ struct BlockwiseReduceRewritePattern
 
     // The following RAII scope will create register to LDS store loop
     {
-      SmallVector<int64_t> bounds(regTensorShape.size(), 1LL);
-      SmallVector<int64_t> strides(regTensorShape.size(), 1LL);
+      SmallVector<int64_t> bounds(regShape.size(), 1LL);
+      SmallVector<int64_t> strides(regShape.size(), 1LL);
 
       // Create thread-based view of the tensor
 
@@ -481,15 +589,15 @@ struct BlockwiseReduceRewritePattern
       }
       // This is viewing registers as the tensor as opposed to the flat array it is.
       // i.e. tensor of {d0, ... , dn} where d are dimensions of original tensor {D0, ... , Dn}.
-      // where dx is a subset of Dx.
-      SmallVector<Value, 4> registerTensorCoords (regTensorShape.size(), zeroConstantOp);
-      SmallVector<Value, 4> registerInputViewCoords = registerTensorCoords;
+      // where dx is a subset of Dx. Moreover, in-order to figure out which subset
+      // tid is also used as part of the coordinates.
+      SmallVector<Value, 4> registerInputViewCoords (regShape.size(), zeroConstantOp);
       registerInputViewCoords.push_back(tid);
 
       //Store loop
       TransformingForOp LDSStoreLoop = rewriter.create<TransformingForOp>(
-        loc, ArrayRef<ValueRange>{registerTensorCoords, registerInputViewCoords},
-        ArrayRef<Attribute>{inputView, regTransforms}, ArrayRef<int64_t>(bounds),
+        loc, ArrayRef<ValueRange>{registerInputViewCoords, registerInputViewCoords},
+        ArrayRef<Attribute>{regTransforms, inputView}, ArrayRef<int64_t>(bounds),
         ArrayRef<int64_t>(strides),
         /*forceUnroll=*/true, /*useIndexDiffs=*/true);
       {
@@ -510,21 +618,16 @@ struct BlockwiseReduceRewritePattern
         // This means there aren't enough threads to do a parallel reduction
         // each individual thread could do its own reduction.
         ArrayAttr threadViewTrs = createThreadViewForNRLargerThanThreads(loc, regTensorShape, blockSize, axis, rewriter);
-
-        // inputView is viewing the input reg from the virtual preReduce tensor.
-        // threadViewTrs is viewing thread-level from the virtual preReduce tensor.
-        // So when we invert inputView and plug into threadViewTrs, we get input reg view from thread-level view.
-        SmallVector<TransformMapAttr, 4> regToPreReduceTensorToThreadView = llvm::to_vector<4>(threadViewTrs.getAsRange<TransformMapAttr>());
-        TransformMapAttr invertInputView = invertTransformMap(rewriter, inputView, loc);
-        regToPreReduceTensorToThreadView.push_back(invertInputView);
-        // TODO : create array attr to be used with down TransformingForOp
-        ArrayAttr regToPreReduceTensorToThreadViewAttr = rewriter.getArrayAttr(regToPreReduceTensorToThreadView);
-
         ArrayRef<int64_t> threadViewShape = threadViewTrs[0].cast<TransformMapAttr>().getUpperBounds();
         constexpr size_t nrIterDim = 1;
         constexpr size_t rIterDim = 2;
 
         int64_t nrIterVectorLen = getMaxVectorizationForDatatype(threadViewTrs, nrIterDim, threadViewShape[nrIterDim], regTensorShape, elemType);
+        // Create the accumulation register
+        // This will be accumulated over non-reduction iterations.
+        Value accReg = rewriter.create<GpuAllocOp>(loc, vectorTypeOrSelf(elemType, nrIterVectorLen));
+        arith::ConstantOp initVal = getReductionInitValue(op, rewriter);
+        rewriter.create<FillOp>(loc, accReg, initVal.getResult());
         AffineForOp nrIterLoop = rewriter.create<AffineForOp>(loc, 0, threadViewShape[nrIterDim] - 1, nrIterVectorLen);
         {
           // inside the loop.
@@ -538,45 +641,182 @@ struct BlockwiseReduceRewritePattern
           SmallVector<int64_t> strides{1, 1, rIterVectorLen};
 
           TransformingForOp reductionLoop = rewriter.create<TransformingForOp>(
-          loc, inits, ArrayRef<Attribute>{threadViewTrs, regToPreReduceTensorToThreadView}, ArrayRef<int64_t>(bounds),
+          loc, inits, ArrayRef<Attribute>{threadViewTrs}, ArrayRef<int64_t>(bounds),
           ArrayRef<int64_t>(strides), /*forceUnroll=*/true, /*useIndexDiffs=*/true);
           {
             PatternRewriter::InsertionGuard guard(rewriter);
             rewriter.setInsertionPointToStart(reductionLoop.getBody());
             Block::BlockArgListType LDSLoadCoords = reductionLoop.getLowerCoords(/*domain=*/0);
-
-            if(nrIterVectorLen > 1){
-              // This means non-reduction dimension is contigous in memory.
-              Type loadTypeInputReg = vectorTypeOrSelf(elemType, nrIterVectorLen);
-              // This is expected to be a vector of values that are not being reduced with each other.
-              Value loadVal = rewriter.create<InBoundsLoadOp>(loc, loadTypeInputReg, workspaceLDSBuffer, LDSLoadCoords);
-            }
-            else if(rIterVectorLen > 1){
-              // This means reduction dimension is contigous in memory.
-
-            }
-            else{
-              // non of them are contigous in memory
-            }
-
+            Value loadVal = rewriter.create<InBoundsLoadOp>(loc, vectorTypeOrSelf(elemType, rIterVectorLen), workspaceLDSBuffer, LDSLoadCoords);
+            Value loadAcc = rewriter.create<InBoundsLoadOp>(loc, accReg.getType(), accReg, zeroConstantOp);
+            Value reduced = createReducingOp(op, loadVal, loadAcc, rewriter);
+            rewriter.create<InBoundsStoreOp>(loc, reduced, accReg, zeroConstantOp);
           }
-
-
         }
 
-
+        // TODO : add the store loop from LDS back to registers here...
       }
       else{
+        // This means there are more threads than elements to be reduced.
+        ArrayAttr threadViewTrs = createThreadViewforNRSmallerThanThreads(loc, regTensorShape, blockSize, axis, rewriter);
+        ArrayRef<int64_t> threadViewShape = threadViewTrs[0].cast<TransformMapAttr>().getUpperBounds();
+        constexpr size_t nrTidDim = 0;
+        constexpr size_t rTidDim = 1;
+        constexpr size_t rIterDim = 2;
 
+        int64_t rIterVectorLen = getMaxVectorizationForDatatype(threadViewTrs, rIterDim, threadViewShape[rIterDim], regTensorShape, elemType);
+        Value nrDimSizeProductConst = rewriter.create<arith::ConstantIndexOp>(loc, nonReductionDimSizeProduct);
+        Value nrtid = rewriter.create<arith::DivSIOp>(loc, tid, nonReductionDimSizeProduct);
+        Value rtid = rewriter.create<arith::RemSIOp>(loc, tid, nonReductionDimSizeProduct);
+        Value rtidDimSizeVal = rewriter.create<arith::ConstantIndexOp>(loc, threadViewShape[rTidDim]);
+
+        // This is where thread_wise reduction result is stored.
+        Value accReg;
+        // This RAII scope would create a loop to iteratively partialy reduce
+        // on a thread basis until items to reduce will match the available 
+        // number of threads.
+        {
+          SmallVector<Value, 4> inits{nrtid, rtid, zeroConstantOp};
+          SmallVector<int64_t> bounds{1, 1, threadViewShape[rIterDim]};
+          SmallVector<int64_t> strides{1, 1, rIterVectorLen};
+
+          Type loadTypeInputReg = vectorTypeOrSelf(elemType, rIterVectorLen);
+          Value accReg = rewriter.create<GpuAllocOp>(loc, loadTypeInputReg);
+          arith::ConstantOp initVal = getReductionInitValue(op, rewriter);
+          rewriter.create<FillOp>(loc, accReg, initVal.getResult());
+
+          TransformingForOp reductionLoop = rewriter.create<TransformingForOp>(
+            loc, inits, ArrayRef<Attribute>{threadViewTrs}, ArrayRef<int64_t>(bounds),
+            ArrayRef<int64_t>(strides), /*forceUnroll=*/true, /*useIndexDiffs=*/true);
+          {
+            PatternRewriter::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(reductionLoop.getBody());
+            Block::BlockArgListType LDSLoadCoords = reductionLoop.getLowerCoords(/*domain=*/0);
+            Value loadVal = rewriter.create<InBoundsLoadOp>(loc, loadTypeInputReg, workspaceLDSBuffer, LDSLoadCoords);
+            Value loadAcc = rewriter.create<InBoundsLoadOp>(loc, accReg.getType(), accReg, zeroConstantOp);
+            Value reduced = createReducingOp(op, loadVal, loadAcc, rewriter);
+            rewriter.create<InBoundsStoreOp>(loc, reduced, accReg, zeroConstantOp);
+          }
+        }
+
+        // This RAII scope would store the partial reductions to 
+        // LDS
+        {
+          SmallVector<Value, 4> inits{nrtid, rtid, zeroConstantOp};
+          SmallVector<int64_t> bounds{1, 1, 1};
+          SmallVector<int64_t> strides{1, 1, 1};
+
+          TransformingForOp reductionLoop = rewriter.create<TransformingForOp>(
+            loc, inits, ArrayRef<Attribute>{threadViewTrs}, ArrayRef<int64_t>(bounds),
+            ArrayRef<int64_t>(strides), /*forceUnroll=*/true, /*useIndexDiffs=*/true);
+          {
+            PatternRewriter::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(reductionLoop.getBody());
+            Block::BlockArgListType LDSStoreCoords = reductionLoop.getLowerCoords(/*domain=*/0);
+            Value loadVal = rewriter.create<InBoundsLoadOp>(loc, accReg.getType(), accReg, zeroConstantOp);
+            rewriter.create<InBoundsStoreOp>(loc, loadVal, workspaceLDSBuffer, LDSStoreCoords);
+          }
+        }
+
+        // This RAII scope would do the following :
+        // LDS[rtid] = reduce(LDS[rtid], LDS[rtid + offset])
+        // where offset is a power of 2.
+        // Initial it starts with power = ceil(|rtid| / 2, power of 2)
+        // Then keep on reducing the power.
+        {
+          double log2HalfRtidDimSize = std::log2(static_cast<double>(threadViewShape[rTidDim]) / 2);
+          int64_t ceilLog2HalfRtidDimSize = static_cast<int64_t>(std::ceil(log2HalfRtidDimSize));
+          int64_t ceilPowerOf2 = 1 << ceilLog2HalfRtidDimSize;
+
+          for(int64_t offset = ceilPowerOf2; offset >= 1; offset = offset >> 1){
+            Value offsetVal = rewriter.create<arith::ConstantIndexOp>(loc, offset);
+            Value rtidPlusOffsetVal = rewriter.create<arith::AddIOp>(loc, rtid, offset);
+            Value isValid = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, rtidPlusOffsetVal, rtidDimSizeVal);
+            scf::IfOp ifb = b.create<scf::IfOp>(loc, isValid, /*withElseRegion=*/false);
+            {
+              OpBuilder thenb = ifb.getThenBodyBuilder(b.getListener());
+              SmallVector<Value, 4> firstInits{nrtid, rtid, zeroConstantOp};
+              SmallVector<Value, 4> secondInits{nrtid, rtidPlusOffsetVal, zeroConstantOp};
+              SmallVector<int64_t> bounds{1, 1, 1};
+              SmallVector<int64_t> strides{1, 1, 1};
+
+              TransformingForOp reductionLoop = rewriter.create<TransformingForOp>(
+                loc, ArrayRef<ValueRange>{firstInits, secondInits}, ArrayRef<Attribute>{threadViewTrs, threadViewTrs}, ArrayRef<int64_t>(bounds),
+                ArrayRef<int64_t>(strides), /*forceUnroll=*/true, /*useIndexDiffs=*/true);
+              {
+                PatternRewriter::InsertionGuard guard(rewriter);
+                rewriter.setInsertionPointToStart(reductionLoop.getBody());
+                Block::BlockArgListType firstLDSLoadCoords = reductionLoop.getLowerCoords(/*domain=*/0);
+                Value firstLoadVal = rewriter.create<InBoundsLoadOp>(loc, elemType, workspaceLDSBuffer, firstLDSLoadCoords);
+                Block::BlockArgListType secondLDSLoadCoords = reductionLoop.getLowerCoords(/*domain=*/1);
+                Value secondLoadVal = rewriter.create<InBoundsLoadOp>(loc, elemType, workspaceLDSBuffer, secondLDSLoadCoords);
+                Value reduced = createReducingOp(op, firstLoadVal, secondLoadVal, rewriter);
+                rewriter.create<InBoundsStoreOp>(loc, reduced, workspaceLDSBuffer, firstLDSLoadCoords);
+                rewriter.create<LDSBarrierOp>(loc);
+              }
+            }
+        }
+
+        // This RAII scope would load the reduce value
+        //to register in to threads. Moreover, it will
+        //do an implicit broadcast of the reduced value
+        //back to threads.
+        // TODO : refactor the following with above
+        {
+          ArrayAttr reducedInputViewTrs = appendReducedDimView(loc, inputView, axis, rewriter);
+          SmallVector<int64_t> bounds(regShape.size(), 1LL);
+          SmallVector<int64_t> strides(regShape.size(), 1LL);
+
+          // Create thread-based view of the tensor
+
+          //Create iteration inits.
+          auto [buffer, regTransforms] = untransform(rewriter, inputReg);
+          ArrayRef<int64_t> bufferShape =
+            buffer.getType().cast<ShapedType>().getShape();
+          Type loadTypeInputReg = elemType;
+          for(int64_t dim=0; dim < regShape.size(); dim++){
+            // if it is the reduction axis, we dont use the vectorization.
+            if(axis == dim){
+              strides[dim] = 1;
+            }
+            else{
+              // Check the vectorLen w.r.t registers
+              int64_t vectorLenReg = getMaxVectorizationForDatatype(regTransforms, dim, regShape[dim], bufferShape, elemType);
+              // Check the vectorLen w.r.t virtual input tensor as we would need to store them to LDS
+              int64_t vectorLenVirtual = getMaxVectorizationForDatatype(reducedInputViewTrs, dim, regShape[dim], inputView.getLowerBounds().asArrayRef(), elemType);
+              int64_t vectorLen = std::min(vectorLenVirtual, vectorLenReg);
+              Type loadTypeInputReg = vectorTypeOrSelf(elemType, vectorLen);
+              strides[dim] = vectorLen;
+              // There will only one dimension that will be vectorized.
+              if(vectorLen > 1){
+                break;
+              }
+            }
+          }
+          // This is viewing registers as the tensor as opposed to the flat array it is.
+          // i.e. tensor of {d0, ... , dn} where d are dimensions of original tensor {D0, ... , Dn}.
+          // where dx is a subset of Dx. Moreover, in-order to figure out which subset
+          // tid is also used as part of the coordinates.
+          SmallVector<Value, 4> registerInputViewCoords (regShape.size(), zeroConstantOp);
+          registerInputViewCoords.push_back(tid);
+
+          //Store loop
+          TransformingForOp LDSStoreLoop = rewriter.create<TransformingForOp>(
+            loc, ArrayRef<ValueRange>{registerInputViewCoords, registerInputViewCoords},
+            ArrayRef<Attribute>{regTransforms, reducedInputViewTrs}, ArrayRef<int64_t>(bounds),
+            ArrayRef<int64_t>(strides),
+            /*forceUnroll=*/true, /*useIndexDiffs=*/true);
+          {
+            PatternRewriter::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(LDSStoreLoop.getBody());
+            Block::BlockArgListType registerStoreCoords = LDSStoreLoop.getLowerCoords(/*domain=*/0);
+            Block::BlockArgListType ldsLoadCoords = LDSStoreLoop.getLowerCoords(/*domain=*/1);
+            Value loadVal = rewriter.create<InBoundsLoadOp>(loc, loadTypeInputReg, workspaceLDSBuffer, ldsLoadCoords);
+            rewriter.create<InBoundsStoreOp>(loc, loadVal, inputReg, registerStoreCoords);
+          }
+        }
       }
     }
-
-
-
-
-
-
-
 
     return success();
   }
