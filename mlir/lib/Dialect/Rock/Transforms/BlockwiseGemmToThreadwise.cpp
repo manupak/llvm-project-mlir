@@ -524,43 +524,16 @@ struct BlockwiseReduceRewritePattern
     }
   }
 
-  int64_t getVectorLenStrides(TypedValue<MemRefType> reg, TransformMapAttr ldsView, size_t redAxis, ConversionPatternRewriter& rewriter, SmallVectorImpl<int64_t>& strides) const {
-      auto [buffer, regTransforms] = untransform(rewriter, reg);
-      ArrayRef<int64_t> bufferShape =
-        buffer.getType().cast<ShapedType>().getShape();
-      Type elemType = reg.getType().getElementType();
-      ArrayRef<int64_t> regShape = reg.getType().getShape();
-      int64_t vectorLen = 1;
-      for(size_t dim=0; dim < regShape.size(); dim++){
-        // if it is the reduction axis, we dont use the vectorization.
-        if(redAxis == dim){
-          strides[dim] = 1;
-        }
-        else{
-          // Check the vectorLen w.r.t registers
-          int64_t vectorLenReg = getMaxVectorizationForDatatype(regTransforms, dim, regShape[dim], bufferShape, elemType);
-          // Check the vectorLen w.r.t virtual input tensor as we would need to store them to LDS
-          ArrayAttr ldsViewArrAttr = rewriter.getArrayAttr(SmallVector<Attribute>(ldsView.getOps()));
-          int64_t vectorLenVirtual = getMaxVectorizationForDatatype(ldsViewArrAttr, dim, regShape[dim], ldsView.getLowerBounds().asArrayRef(), elemType);
-          int64_t vectorLen = std::min(vectorLenVirtual, vectorLenReg);
-          strides[dim] = vectorLen;
-          // There will only one dimension that will be vectorized.
-          if(vectorLen > 1){
-            break;
-          }
-        }
-      }
-      return vectorLen;
-  }
-
   LogicalResult matchAndRewrite(BlockwiseReduceOp op,
                                 BlockwiseReduceOpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
-    // inputView should be register {{coords}, tid} to virtual tensor coords transforms.
+    // inputView should be register {bid, tid, iter} to virtual tensor {D0, ... , Dr , ... , Dn} 
+    // coords transforms where Dr is the reduction axis.
     TransformMapAttr inputView = op.getInputRegViewAttr();
+    ArrayAttr inputViewArrayAttr = rewriter.getArrayAttr(inputView);
     TypedValue<MemRefType> inputReg = op.getInput();
-    ArrayRef<int64_t> regShape = inputReg.getType().getShape();
+    TypedValue<MemRefType> outputReg = op.getOutput();
     Type elemType = inputReg.getType().getElementType();
     TypedValue<MemRefType> workspaceLDSBuffer = op.getWorkspaceBuffer();
     Value zeroConstantOp = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -582,42 +555,7 @@ struct BlockwiseReduceRewritePattern
       return static_cast<int64_t>(val);
     });
 
-    // The following RAII scope will create register to LDS store loop
-    {
-      SmallVector<int64_t> bounds(regShape.size(), 1LL);
-      SmallVector<int64_t> strides(regShape.size(), 1LL);
-
-      // Create thread-based view of the tensor
-
-      //Create iteration inits.
-      ArrayAttr regTransforms;
-      std::tie(std::ignore, regTransforms) = untransform(rewriter, inputReg);
-      int64_t vectorLen = getVectorLenStrides(inputReg, inputView, axis, rewriter, strides);
-      Type loadTypeInputReg = vectorTypeOrSelf(elemType, vectorLen);
-
-      // This is viewing registers as the tensor as opposed to the flat array it is.
-      // i.e. tensor of {d0, ... , dn} where d are dimensions of original tensor {D0, ... , Dn}.
-      // where dx is a subset of Dx. Moreover, in-order to figure out which subset
-      // tid is also used as part of the coordinates.
-      SmallVector<Value, 4> registerInputViewCoords (regShape.size(), zeroConstantOp);
-      registerInputViewCoords.push_back(tid);
-
-      //Store loop
-      TransformingForOp LDSStoreLoop = rewriter.create<TransformingForOp>(
-        loc, ArrayRef<ValueRange>{registerInputViewCoords, registerInputViewCoords},
-        ArrayRef<Attribute>{regTransforms, inputView}, ArrayRef<int64_t>(bounds),
-        ArrayRef<int64_t>(strides),
-        /*forceUnroll=*/true, /*useIndexDiffs=*/true);
-      {
-        PatternRewriter::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(LDSStoreLoop.getBody());
-        Block::BlockArgListType registerLoadCoords = LDSStoreLoop.getLowerCoords(/*domain=*/0);
-        Block::BlockArgListType ldsStoreCoords = LDSStoreLoop.getLowerCoords(/*domain=*/1);
-        Value loadVal = rewriter.create<InBoundsLoadOp>(loc, loadTypeInputReg, inputReg, registerLoadCoords);
-        rewriter.create<InBoundsStoreOp>(loc, loadVal, workspaceLDSBuffer, ldsStoreCoords);
-      }
-    }
-
+    rewriter.create<ThreadwiseMemCpyOp>(loc, inputReg, workspaceLDSBuffer, /*extraSrcViews=*/nullptr, inputViewArrayAttr, true, true);
 
     //Following RAII scope will create reduction loops.
     {
@@ -664,7 +602,7 @@ struct BlockwiseReduceRewritePattern
           }
         }
 
-        // TODO : add the store loop from LDS back to registers here...
+        rewriter.create<ThreadwiseMemCpyOp>(loc, workspaceLDSBuffer, outputReg, inputViewArrayAttr, /*extraDstViews=*/nullptr, true, true);
       }
       else{
         // This means there are more threads than elements to be reduced.
@@ -765,45 +703,8 @@ struct BlockwiseReduceRewritePattern
               }
             }
         }
-
-        // This RAII scope would load the reduce value
-        //to register in to threads. Moreover, it will
-        //do an implicit broadcast of the reduced value
-        //back to threads.
-        {
-          ArrayAttr reducedInputViewTrs = appendReducedDimView(loc, inputView, axis, rewriter);
-          SmallVector<int64_t> bounds(regShape.size(), 1LL);
-          SmallVector<int64_t> strides(regShape.size(), 1LL);
-
-          // Create thread-based view of the tensor
-
-          //Create iteration inits.
-          ArrayAttr regTransforms;
-          std::tie(std::ignore, regTransforms) = untransform(rewriter, inputReg);
-          int64_t vectorLen = getVectorLenStrides(inputReg, inputView, axis, rewriter, strides);
-          Type loadTypeInputReg = vectorTypeOrSelf(elemType, vectorLen);
-          // This is viewing registers as the tensor as opposed to the flat array it is.
-          // i.e. tensor of {d0, ... , dn} where d are dimensions of original tensor {D0, ... , Dn}.
-          // where dx is a subset of Dx. Moreover, in-order to figure out which subset
-          // tid is also used as part of the coordinates.
-          SmallVector<Value, 4> registerInputViewCoords (regShape.size(), zeroConstantOp);
-          registerInputViewCoords.push_back(tid);
-
-          //Store loop
-          TransformingForOp LDSStoreLoop = rewriter.create<TransformingForOp>(
-            loc, ArrayRef<ValueRange>{registerInputViewCoords, registerInputViewCoords},
-            ArrayRef<Attribute>{regTransforms, reducedInputViewTrs}, ArrayRef<int64_t>(bounds),
-            ArrayRef<int64_t>(strides),
-            /*forceUnroll=*/true, /*useIndexDiffs=*/true);
-          {
-            PatternRewriter::InsertionGuard guard(rewriter);
-            rewriter.setInsertionPointToStart(LDSStoreLoop.getBody());
-            Block::BlockArgListType registerStoreCoords = LDSStoreLoop.getLowerCoords(/*domain=*/0);
-            Block::BlockArgListType ldsLoadCoords = LDSStoreLoop.getLowerCoords(/*domain=*/1);
-            Value loadVal = rewriter.create<InBoundsLoadOp>(loc, loadTypeInputReg, workspaceLDSBuffer, ldsLoadCoords);
-            rewriter.create<InBoundsStoreOp>(loc, loadVal, inputReg, registerStoreCoords);
-          }
-        }
+        ArrayAttr reducedInputViewTrs = appendReducedDimView(loc, inputView, axis, rewriter);
+        rewriter.create<ThreadwiseMemCpyOp>(loc, workspaceLDSBuffer, outputReg, reducedInputViewTrs, /*extraDstViews=*/nullptr, true, true);
       }
     }
 
