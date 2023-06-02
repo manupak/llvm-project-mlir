@@ -1453,7 +1453,7 @@ LogicalResult ThreadwiseMemCpyOp::verify() {
   // Unless specified it is assumed to be global
   gpu::AddressSpace srcGpuMemSpace = gpu::AddressSpace::Global;
   if (srcMemSpaceAttr) {
-    srcMemSpaceAttr.cast<gpu::AddressSpaceAttr>().getValue();
+    srcGpuMemSpace = srcMemSpaceAttr.cast<gpu::AddressSpaceAttr>().getValue();
   }
 
   SmallVector<std::pair<gpu::AddressSpace, gpu::AddressSpace>, 2>
@@ -1469,7 +1469,7 @@ LogicalResult ThreadwiseMemCpyOp::verify() {
             return allowedComb.first == srcGpuMemSpace &&
                    allowedComb.second == destGpuMemSpace;
           })) {
-    return emitOpError("src,dest needs to be either global->regs or regs->lds");
+    return emitOpError("src,dest needs to be either global->regs or regs->lds not ") << (int)srcGpuMemSpace << " to " << (int)destGpuMemSpace;
   }
 
   auto maybeExtraSrcViews = getExtraSrcViews();
@@ -1510,18 +1510,18 @@ LogicalResult ThreadwiseMemCpyOp::verify() {
   if (destGpuMemSpace == gpu::AddressSpace::Global) {
     if (outputShape.size() != 3) {
       return emitOpError(
-          "global source view must accept (bid, tid, iter) coordinates");
+          "global dest view must accept (bid, tid, iter) coordinates");
     }
   }
   if (destGpuMemSpace == gpu::AddressSpace::Workgroup) {
     if (outputShape.size() != 2) {
       return emitOpError(
-          "workgroup source view must accept (tid, iter) coordinates");
+          "workgroup dest view must accept (tid, iter) coordinates");
     }
   }
   if (destGpuMemSpace == gpu::AddressSpace::Private) {
     if (outputShape.size() != 1) {
-      return emitOpError("register source view must accept (iter) coordinates");
+      return emitOpError("register dest view must accept (iter) coordinates");
     }
   }
 
@@ -1708,27 +1708,47 @@ LogicalResult ReduceOp::verify() {
 //===-----------------------------------------------------===//
 
 LogicalResult BlockwiseReduceOp::verify() {
-  TransformMapAttr inputView = getInputRegViewAttr();
-  ArrayRef<llvm::StringRef> upperNames = inputView.getOps()[0].getUpperNames();
-  // We expect the view of the register as part of the all tensor to be:
-  // {d0, ... , dn, tid} where d are dimensions of original tensor to
-  // {D0, ... , Dn} of the full tensor. dx is the subset of Dx dimension
-  // within a thread.
-  if(upperNames.size() < 1 || upperNames.back() != "tid"){
-    return emitError("The thread view shape has to be { ... , tid }");
+  ArrayAttr inputViewArrayAttr = getInputRegViewAttr();
+  // This view should be {bid, tid, iter} to {bid, d0, ... , Dr , ... , dn};
+  // Moreover, {bid, d0, ... , Dr , ... , dn} --> {D0, ... , Dr , ... , Dn} 
+  // should not be a part of this view where the latter is the larger 
+  // input tensors that being reduced accross blocks.
+
+  TransformMapAttr inputView = inputViewArrayAttr[0].cast<TransformMapAttr>();
+  ArrayRef<int64_t> inputTensorShape = inputView.getLowerBounds().asArrayRef();
+  ArrayRef<int64_t> inputThreadView = inputView.getUpperBounds().asArrayRef();
+  ArrayRef<int64_t> wsShape = getWorkspaceBuffer().getType().getShape();
+  int64_t blockSize = getBlockSize();
+  int64_t gridSize = getGridSize();
+
+  if(getInput().getType().getMemorySpace().cast<gpu::AddressSpaceAttr>().getValue() != gpu::AddressSpace::Private){
+    return emitError("input should be in regs.");
   }
-  TypedValue<MemRefType> workspaceBuffer = getWorkspaceBuffer();
-  ArrayRef<int64_t> workspaceBufferShape = workspaceBuffer.getType().getShape();
-  if(llvm::any_of(llvm::zip(workspaceBufferShape, inputView.getUpperBounds().asArrayRef()), [](std::tuple<int64_t, int64_t> pair){
-    auto [wsDim, inDim] = pair;
-    if(wsDim != inDim){
-      return false;
+  if(getOutput().getType().getMemorySpace().cast<gpu::AddressSpaceAttr>().getValue() != gpu::AddressSpace::Private){
+    return emitError("output should be in regs.");
+  }
+  if(getWorkspaceBuffer().getType().getMemorySpace().cast<gpu::AddressSpaceAttr>().getValue() != gpu::AddressSpace::Workgroup){
+    return emitError("workspace should be in LDS.");
+  }
+
+  if(inputTensorShape[0] != gridSize){
+    return emitError("first dim of the input tensor should bid");
+  }
+  if(inputThreadView[0] != gridSize){
+    return emitError("first dim of the input thread should bid");
+  }
+  if(inputThreadView[1] != blockSize){
+    return emitError("second dim of the input thread should tid");
+  }
+  if(inputTensorShape.slice(1).size() != wsShape.size()){
+    return emitError("The input and workspace should be of same rank!");
+  }
+  for(auto [inDimSize, wsDimSize] : llvm::zip(inputTensorShape.slice(1), wsShape)){
+    if(inDimSize != wsDimSize){
+      return emitError("The workspace and input dims are not matching...");
     }
-    return true;
   }
-  )){
-    return emitError("The shapes of virtual input tensor and workspace buffer needs to match.");
-  }
+
   return success();
 }
 

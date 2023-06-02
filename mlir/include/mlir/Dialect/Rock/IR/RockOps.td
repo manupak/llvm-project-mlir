@@ -1147,13 +1147,12 @@ def Rock_BlockwiseGemmAccelOp:
 // blockwise_reduction
 def Rock_BlockwiseReduceOp:
     Rock_Op<"blockwise_reduce">,
-    Arguments<(ins MemRefOf<AccelResTypes>:$input,
+    Arguments<(ins MemRefOf<GemmOutputTypes>:$input,
                    MemRefOf<LdsBufferTypes>:$workspace_buffer,
-                   MemRefOf<AccelResTypes>:$output,
+                   MemRefOf<GemmOutputTypes>:$output,
                    IndexAttr:$axis,
                    ReduceMethodAttr:$reduceMethod,
-                   Rock_TransformMapAttr:$inputRegView,
-                   Rock_TransformMapAttr:$outputRegView,
+                   TransformMapArrayAttr:$inputRegView,
                    I32Attr:$blockSize,
                    I32Attr:$gridSize
                    )> {
@@ -1162,17 +1161,22 @@ def Rock_BlockwiseReduceOp:
     The `rock.blockwise_reduce` op does reduce at a blockwise level.
 
     $input tensor resides in registers in threads.
-    This is supplemented with $inputRegView view that provides a threadwise 
-    view of input tensor.
 
-    $output tensor resides in registers in threads.
-    This is supplemented with $outputRegView view that provides a threadwise 
-    view of output tensor. This could be broadcasted depending on what user wants to do.
+    $inputRegView should be register {bid, tid, iter} 
+    to virtual tensor {bid, d0, ... , Dr , ... , dn} which is a slice of
+    a larger tensor {D0, ... , Dr , ... , Dn}. Note that the reduction
+    axis (Dr) is not sliced because it is not supported.
+
+    $output tensor resides in registers in threads. It would have
+    the same dimensionality of the input tensor but broadcasted.
+    So the users of the op, has to add a extraView if they are writing back
+    to some memory (LDS/Global) to bar threads (or iteration within threads)
+    to not to create a broadcasted tensor.
 
     $workspace_buffer resides in LDS. This should have the shape of the input tensor.
   }];
   let assemblyFormat = [{
-    $reduceMethod $input `into` $output `using` $workspace_buffer attr-dict `:` type($input) `using` type($workspace_buffer) `into` type($output)
+    $reduceMethod $inputRegView $input `into` $output `using` $workspace_buffer attr-dict `:` type($input) `using` type($workspace_buffer) `into` type($output)
   }];
 
   let hasVerifier = 1;
