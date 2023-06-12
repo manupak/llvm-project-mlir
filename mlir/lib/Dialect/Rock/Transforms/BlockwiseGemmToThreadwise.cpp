@@ -674,7 +674,7 @@ LogicalResult ThreadwiseReadIntoRewritePattern::matchAndRewrite(
     srcAddrSpace =
         srcBufferType.getMemorySpace().cast<gpu::AddressSpaceAttr>().getValue();
   }
-  DenseMap<gpu::AddressSpace, size_t> iterDim{
+  const llvm::SmallDenseMap<gpu::AddressSpace, size_t> iterDim{
       {gpu::AddressSpace::Workgroup, 1},
       {gpu::AddressSpace::Global, 2},
   };
@@ -682,7 +682,7 @@ LogicalResult ThreadwiseReadIntoRewritePattern::matchAndRewrite(
   // We are vectorizing in the iter dimension, not block ID or thread ID
   auto elementType = sourceView.getType().getElementType();
   int64_t vectorLen =
-      getMaxVectorizationForDatatype(transforms, /*dim=*/iterDim[srcAddrSpace],
+      getMaxVectorizationForDatatype(transforms, /*dim=*/iterDim.lookup(srcAddrSpace),
                                      numValues, bufferShape, elementType);
   LLVM_DEBUG(llvm::dbgs() << "Max vectorization for read_into = " << vectorLen
                           << "\n");
@@ -721,7 +721,7 @@ LogicalResult ThreadwiseReadIntoRewritePattern::matchAndRewrite(
           loadLoop.getLowerCoords(/*domain=*/0));
       b.create<InBoundsStoreOp>(
           loc, loaded, dest,
-          loadLoop.getLowerCoords(/*domain=*/1)[iterDim[srcAddrSpace]]);
+          loadLoop.getLowerCoords(/*domain=*/1)[iterDim.lookup(srcAddrSpace)]);
     } else {
       TypedValue<IntegerType> valid = loadLoop.getValidity(/*domain=*/0);
       scf::IfOp ifb =
@@ -739,7 +739,7 @@ LogicalResult ThreadwiseReadIntoRewritePattern::matchAndRewrite(
       }
       b.create<InBoundsStoreOp>(
           loc, ifb.getResult(0), dest,
-          loadLoop.getLowerCoords(/*domain=*/1)[iterDim[srcAddrSpace]]);
+          loadLoop.getLowerCoords(/*domain=*/1)[iterDim.lookup(srcAddrSpace)]);
     }
   }
   b.eraseOp(op);
