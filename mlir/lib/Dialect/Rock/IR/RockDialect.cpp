@@ -1566,6 +1566,10 @@ LogicalResult ThreadwiseGemmOp::verify() {
 //===----------------------------------------------------------------------===//
 // AccelGemmOp
 //===----------------------------------------------------------------------===//
+LogicalResult GridwiseAttentionAccelOp::verify() {
+  return success();
+}
+
 LogicalResult AccelGemmOp::verify() {
   ArrayRef<int64_t> aShape = getMatrixA().getType().getShape(),
                     bShape = getMatrixB().getType().getShape();
@@ -1574,6 +1578,7 @@ LogicalResult AccelGemmOp::verify() {
     return emitOpError("K dimensions don't match");
   return success();
 }
+
 //===----------------------------------------------------------------------===//
 // InWarpTransposeOp
 //===----------------------------------------------------------------------===//

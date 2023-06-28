@@ -987,6 +987,136 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
 };
 
 //===----------------------------------------------------------------------===//
+// GridwiseAttentionAccel lowering.
+//===----------------------------------------------------------------------===//
+
+struct GridwiseAttentionAccelRewritePattern
+    : public OpRewritePattern<GridwiseAttentionAccelOp> {
+  using OpRewritePattern<GridwiseAttentionAccelOp>::OpRewritePattern;
+
+  LogicalResult prepareGemmInput(Location loc,
+                                 TypedValue<MemRefType> in,
+                                 StringRef nonKDimName,
+                                 int64_t kPerBlock,
+                                 int64_t dPerBlock,
+                                 int64_t kpack,
+                                 uint32_t blockSize,
+                                 uint32_t gridSize,
+                                 ArrayRef<StringRef> bidGridOrder,
+                                 ArrayRef<int64_t> bidGridLengths,
+                                 PatternRewriter &rewriter
+                                 ){
+    auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getPrivateAddressSpace());
+    auto workgroupMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getWorkgroupAddressSpace());
+
+    int64_t copyPerThread = (kPerBlock * dPerBlock) / blockSize;
+    Type elemType = in.getType().getElementType();
+    if (copyPerThread == 0) {
+      return emitError(loc) << "Block size too large, rejecting as invalid.\n";
+    }
+    auto maybeCopyDPerThread = computeCopyPerThread(
+        elemType, copyPerThread, kPerBlock, dPerBlock, kpack, loc);
+    if (failed(maybeCopyDPerThread))
+      return maybeCopyDPerThread;
+
+    int64_t copyKPerThread = (*maybeCopyDPerThread).first;
+    int64_t copyMPerThread = (*maybeCopyDPerThread).second;
+
+    // Find the best way of vectorizing the layout
+    GemmDimension vectorTiebreaker =
+        (kpack > 1) ? GemmDimension::K : GemmDimension::MorN;
+    int64_t vectorLen;
+    GemmDimension vectorDim;
+    std::tie(vectorDim, vectorLen) = bestGlobalVectorization(
+        rewriter, in, copyMPerThread, copyKPerThread, vectorTiebreaker, kPerBlock,
+        dPerBlock, elemType);
+    FailureOr<Value> maybeViewIn = wrapMatrixForGlobalLoad(
+        rewriter, loc, in, nonKDimName, bidGridOrder, bidGridLengths, gridSize,
+        blockSize, kPerBlock, dPerBlock, copyKPerThread, copyMPerThread,
+        vectorDim);
+    if (failed(maybeViewIn)){
+      return maybeViewIn;
+    }
+    Value viewIn = maybeViewIn.value();
+    ArrayAttr threadViewLoadedVec = globalVectorLayout(
+        rewriter, loc, nonKDimName, copyKPerThread, copyMPerThread, kpack, vectorDim);
+    Type loadBufferType = MemRefType::get({copyPerThread}, elemType,
+                                      AffineMap{}, privateMemoryAddressSpace);
+    auto loadBuffer = rewriter.create<GpuAllocOp>(loc, loadBufferType);
+    // Fill me with rock.threadwise_read_into that can accept external indices
+    return success();
+  }
+
+  LogicalResult createGemm(Location loc, 
+                           TypedValue<MemRefType> inA, 
+                           TypedValue<MemRefType> inB, 
+                           RockAccelTuningParamAttrInterface tuningParams,
+                           uint32_t blockSize,
+                           uint32_t gridSize,
+                           PatternRewriter &rewriter) const {
+    auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getPrivateAddressSpace());
+    auto workgroupMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getWorkgroupAddressSpace());
+
+    Type elemType = inA.getType().getElementType();
+    ArrayRef<int64_t> aShape = inA.getType().getShape();
+    ArrayRef<int64_t> bShape = inB.getType().getShape();
+    int64_t G = aShape[0];
+    int64_t K = aShape[1];
+    int64_t M = aShape[2];
+    int64_t N = bShape[2];
+
+    int64_t kpack = tuningParams.getKpack();
+    int64_t kpacksPerBlock = tuningParams.getKpackPerBlock();
+    int64_t mPerBlock = tuningParams.getMPerBlock();
+    int64_t nPerBlock = tuningParams.getNPerBlock();
+    int64_t gemm0MBlocks = M / mPerBlock;
+    int64_t gemm0NBlocks = N / nPerBlock;
+    bool forceUnroll = tuningParams.getForceUnroll();
+    int64_t kPerBlock = kpacksPerBlock * kpack;
+
+
+
+
+
+    return success();
+  }
+
+  LogicalResult matchAndRewrite(GridwiseAttentionAccelOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getPrivateAddressSpace());
+    auto workgroupMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getWorkgroupAddressSpace());
+
+    ArrayRef<int64_t> qShape = op.getQueries().getType().getShape();
+    ArrayRef<int64_t> kShape = op.getKeys().getType().getShape();
+    ArrayRef<int64_t> vShape = op.getValues().getType().getShape();
+    Type elemType = op.getQueries().getType().getElementType();
+    int64_t gemm0G = qShape[0];
+    int64_t gemm0M = qShape[1];
+    int64_t gemm0K = qShape[2];
+    int64_t gemm0N = kShape[2];
+
+    RockAccelTuningParamAttrInterface tuningParams = op.getParams();
+    int64_t kpack = tuningParams.getKpack();
+    int64_t kpacksPerBlock = tuningParams.getKpackPerBlock();
+    int64_t mPerBlock = tuningParams.getMPerBlock();
+    int64_t nPerBlock = tuningParams.getNPerBlock();
+    int64_t gemm0MBlocks = gemm0M / mPerBlock;
+    int64_t gemm0NBlocks = gemm0N / nPerBlock;
+    bool forceUnroll = tuningParams.getForceUnroll();
+    int64_t kPerBlock = kpacksPerBlock * kpack;
+
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // GridwiseGemmAccel lowering.
 //===----------------------------------------------------------------------===//
 
@@ -1400,14 +1530,14 @@ struct GridwiseGemmAccelRewritePattern
 void RockGridwiseGemmToBlockwisePass::runOnOperation() {
   MLIRContext *ctx = &getContext();
   ConversionTarget target(*ctx);
-  target.addIllegalOp<rock::GridwiseGemmOp, rock::GridwiseGemmAccelOp>();
+  target.addIllegalOp<rock::GridwiseGemmOp, rock::GridwiseGemmAccelOp, rock::GridwiseAttentionAccelOp>();
   target.addLegalDialect<arith::ArithDialect, rock::RockDialect,
                          memref::MemRefDialect, AffineDialect,
                          vector::VectorDialect>();
   target.addLegalOp<gpu::PrintfOp>();
 
   RewritePatternSet patterns(ctx);
-  patterns.add<GridwiseGemmRewritePattern, GridwiseGemmAccelRewritePattern>(
+  patterns.add<GridwiseGemmRewritePattern, GridwiseGemmAccelRewritePattern, GridwiseAttentionAccelRewritePattern>(
       ctx);
   if (failed(applyPartialConversion(getOperation(), target,
                                     std::move(patterns)))) {
