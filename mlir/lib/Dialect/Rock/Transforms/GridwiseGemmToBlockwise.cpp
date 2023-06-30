@@ -35,6 +35,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Value.h"
@@ -1117,7 +1118,7 @@ struct GridwiseAttentionAccelRewritePattern
   }
 
   // This function creates the accumulator register buffer
-  Value createBufferForGemmOut(Location loc, rock::accel::AccelEmitterParams params, PatternRewriter& rewriter) const {
+  Value createBufferForAccelGemmOut(Location loc, rock::accel::AccelEmitterParams params, PatternRewriter& rewriter) const {
     auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
         gpu::GPUDialect::getPrivateAddressSpace());
     int64_t nResultVectors = params.nResultVectors;
@@ -1132,6 +1133,16 @@ struct GridwiseAttentionAccelRewritePattern
     Value zeroConstantCOp = createZeroConstantOp(rewriter, loc, accVectorType);
     rewriter.create<FillOp>(loc, regCAllocOp, zeroConstantCOp);
     return regCAllocOp;
+  }
+
+  // This function creates a simple scalar reg buffer (i.e. without vectors)
+  Value createBufferForGemmOut(Location loc, Type gemmOutElemType, rock::accel::AccelEmitterParams params, PatternRewriter& rewriter) const {
+    auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
+        gpu::GPUDialect::getPrivateAddressSpace());
+    int64_t numOutputElements = params.numOutputVectorElements();
+    auto gemmOutScalarBufferType = MemRefType::get(numOutputElements, gemmOutElemType, AffineMap{}, /*memorySpace=*/privateMemoryAddressSpace);
+    Value gemmOutScalarBuffer = rewriter.create<rock::GpuAllocOp>(loc, gemmOutScalarBufferType);
+    return gemmOutScalarBuffer;
   }
 
   // Logic to setup blockwise_gemm_accel parameters.
@@ -1242,7 +1253,17 @@ struct GridwiseAttentionAccelRewritePattern
     auto [fromGlobalRegBufferK, toLDSRegBufferK, ldsByteBufferK] = createBuffersForGemmIn(loc, kPerBlock, blockSize, elemTypeK, nPerBlock, rewriter);
     auto [mMyWaveOffsetQ, mMyWaveOffsetK] = createWaveOffsets(loc, waveSize, tuningParams, accelParamsGemm0, tid, rewriter);
     auto [preAccelRegBufferQ, preAccelRegBufferK] = createRegInterrimBufferForAccel(loc, accelParamsGemm0, rewriter);
-    Value accRegBufferGemm0 = createBufferForGemmOut(loc, accelParamsGemm0, rewriter);
+    Value accRegBufferGemm0 = createBufferForAccelGemmOut(loc, accelParamsGemm0, rewriter);
+    // We just set the output type gemm0 to be F32 for softmax stability
+    // Currently, there is a working assumption that this kernel is meant support fp32/fp16
+    // This should be guranteed by op verifiers.
+    Value gemm0OutBuffer = createBufferForGemmOut(loc, rewriter.getF32Type(), accelParamsGemm0, rewriter);
+
+    // Buffers for reductions
+    MemRefType gemm0OutBufferType = gemm0OutBuffer.getType().cast<MemRefType>();
+    MemRefType ldsWorkspaceBufferType = MemRefType::get({gemm0OutBufferType.getNumElements()}, gemm0OutBufferType.getElementType(), AffineMap{}, workgroupMemoryAddressSpace);
+    Value ldsReductionWorkspaceBuffer = rewriter.create<GpuAllocOp>(loc, ldsWorkspaceBufferType);
+    Value gemm0OutBufferMax = createBufferForGemmOut(loc, rewriter.getF32Type(), accelParamsGemm0, rewriter);
 
     AffineForOp mLoopOp = rewriter.create<AffineForOp>(loc, 0, gemm0MBlocks, 1);
     {
@@ -1306,6 +1327,13 @@ struct GridwiseAttentionAccelRewritePattern
             loc, ldsTileBufferQ, ldsTileBufferK, mMyWaveOffsetQ, mMyWaveOffsetK,
             preAccelRegBufferQ, preAccelRegBufferK, accRegBufferGemm0, op.getArchAttr(), op.getFeaturesAttr(),
             op.getBlockSizeAttr(), op.getParamsAttr());
+        (void)accelEmitterPtrGemm0->computeOutputConversion(rewriter, loc, gemm0M, gemm0N, blockSize, gridSize, accRegBufferGemm0, gemm0OutBuffer, forceUnroll);
+        ArrayAttr gemm0BlockViewMaps = accelEmitterPtrGemm0->computeOutputTransforms(rewriter, loc, gemm0M, gemm0N, blockSize);
+        APInt axis(32, 0);
+        rewriter.create<BlockwiseBroadcastReduceOp>(loc, gemm0OutBuffer, ldsReductionWorkspaceBuffer, gemm0OutBufferMax, axis, rock::ReduceMethod::Max, gemm0BlockViewMaps, blockSize);
+        // Add softmax normalization here.
+        // rewriter.create<linalg::ElemwiseBinaryOp>()
+
       }
     }
 
@@ -1716,7 +1744,7 @@ struct GridwiseGemmAccelRewritePattern
     Value convertedC = b.create<rock::GpuAllocOp>(loc, convertedCType);
 
     ArrayAttr idToMatrixCMaps = accelEmitterPtr->computeOutputTransforms(
-        b, loc, M, N, blockSize, gridSize, regCAllocOp);
+        b, loc, M, N, blockSize, gridSize);
 
     Value registerC = accelEmitterPtr->computeOutputConversion(
         b, loc, M, N, blockSize, gridSize, regCAllocOp, convertedC,

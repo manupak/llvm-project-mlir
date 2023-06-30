@@ -110,11 +110,13 @@ struct AccelEmitter {
                                        Value dWaves, Value laneId) = 0;
 
   /// Compute the output transform map to be used to store the result of the
-  /// matrix multiplication tile
+  /// matrix multiplication tile.
+  /// NOTE : the gridSize is optional, if it is provided this will create a grid-level
+  /// view of the output matrix. If it not provided, this will create a block-level
+  /// view of the output matrix.
   virtual ArrayAttr computeOutputTransforms(PatternRewriter &b, Location loc,
                                             int64_t matrixM, int64_t matrixN,
-                                            int64_t blockSize, int64_t gridSize,
-                                            Value regC) = 0;
+                                            int64_t blockSize, Optional<int64_t> gridSize = std::nullopt) = 0;
 
   /// Convert from memref<?xvector<?xT>> to memref<?xD> where the source T
   /// is the accumulator type and D is the destination type
@@ -155,8 +157,7 @@ struct MfmaEmitter : public AccelEmitter {
 
   ArrayAttr computeOutputTransforms(PatternRewriter &b, Location loc,
                                     int64_t matrixM, int64_t matrixN,
-                                    int64_t blockSize, int64_t gridSize,
-                                    Value regC) override;
+                                    int64_t blockSize, Optional<int64_t> gridSize = std::nullopt) override;
 
 private:
   /// Initialize the emitter parameters for mfma
@@ -185,8 +186,7 @@ struct WmmaEmitter : public AccelEmitter {
 
   ArrayAttr computeOutputTransforms(PatternRewriter &b, Location loc,
                                     int64_t matrixM, int64_t matrixN,
-                                    int64_t blockSize, int64_t gridSize,
-                                    Value regC) override;
+                                    int64_t blockSize, Optional<int64_t> gridSize = std::nullopt) override;
 
 private:
   /// Initialize the emitter parameters for wmma
