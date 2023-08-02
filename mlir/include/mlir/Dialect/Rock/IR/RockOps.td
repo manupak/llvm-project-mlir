@@ -965,6 +965,7 @@ def Rock_ThreadwiseReadIntoOp :
         "destination registers", [MemWrite]>:$dest,
       TransformMapArrayAttr:$extraViews,
       Variadic<Index>:$extraIndices,
+      OptionalAttr<I32Attr>:$forceVecLen,
       UnitAttr:$forceUnroll,
       UnitAttr:$useIndexDiffs
     )> {

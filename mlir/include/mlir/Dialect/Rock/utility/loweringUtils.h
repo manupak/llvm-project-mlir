@@ -55,11 +55,13 @@ getLoadRegsAsTileViews(OpBuilder &b, Location loc, Value globalBuffer,
 // but packed as kOuterPerThread, dPerThread and kPackPerThread for max
 // vectorization of LDS storing. Those views will provide sub-tiles of the
 // respective hierarchy within the GPU. See above about RegsAsMatrixSubTiles
-FailureOr<RegsAsMatrixSubTiles> getPackedRegsAsTileViews(
-    OpBuilder &b, Location loc, Value globalBuffer, StringRef dName,
-    ArrayRef<StringRef> bidGridOrder, ArrayRef<int64_t> bidGridLengths,
-    int64_t blockSize, int64_t kPerBlock, int64_t dPerBlock, int64_t kPerThread,
-    int64_t dPerThread, int64_t kpack, int64_t kpacksPerBlock, bool isKContigousDim);
+FailureOr<RegsAsMatrixSubTiles>
+getPackedRegsAsTileViews(OpBuilder &b, Location loc, Value globalBuffer,
+                         StringRef dName, ArrayRef<StringRef> bidGridOrder,
+                         ArrayRef<int64_t> bidGridLengths, int64_t blockSize,
+                         int64_t kPerBlock, int64_t dPerBlock,
+                         int64_t kPerThread, int64_t dPerThread, int64_t kpack,
+                         int64_t kpacksPerBlock, bool isKContigousDim);
 
 bool isWrWAtomicKernel(GemmFeatures features, Type dataType,
                        bool requiredPadding);
