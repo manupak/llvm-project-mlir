@@ -636,7 +636,7 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
         getPackedRegsAsTileViews(b, loc, op.getA(), "m", bidGridOrder,
                                  bidGridLengths, blockSize, kPerBlock,
                                  mPerBlock, aCopyKPerThread, copyMPerThread,
-                                 kpack, aVectorDim == GemmDimension::K);
+                                 kpack, kpacksPerBlock, aVectorDim == GemmDimension::K);
     if (failed(maybeALdsStoreViews)) {
       return failure();
     }
@@ -655,7 +655,7 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
         getPackedRegsAsTileViews(b, loc, op.getB(), "n", bidGridOrder,
                                  bidGridLengths, blockSize, kPerBlock,
                                  nPerBlock, bCopyKPerThread, copyNPerThread,
-                                 kpack, bVectorDim == GemmDimension::K);
+                                 kpack, kpacksPerBlock, bVectorDim == GemmDimension::K);
     if (failed(maybeBLdsStoreViews)) {
       return failure();
     }
@@ -1009,7 +1009,7 @@ struct GridwiseGemmAccelRewritePattern
         getPackedRegsAsTileViews(b, loc, op.getA(), "m", bidGridOrder,
                                  bidGridLengths, blockSize, kPerBlock,
                                  mPerBlock, aCopyKPerThread, copyMPerThread,
-                                 kpack, aVectorDim == GemmDimension::K);
+                                 kpack, kpacksPerBlock, aVectorDim == GemmDimension::K);
     if (failed(maybeALdsStoreViews)) {
       return failure();
     }
@@ -1028,7 +1028,7 @@ struct GridwiseGemmAccelRewritePattern
         getPackedRegsAsTileViews(b, loc, op.getB(), "n", bidGridOrder,
                                  bidGridLengths, blockSize, kPerBlock,
                                  nPerBlock, bCopyKPerThread, copyNPerThread,
-                                 kpack, bVectorDim == GemmDimension::K);
+                                 kpack, kpacksPerBlock, bVectorDim == GemmDimension::K);
     if (failed(maybeBLdsStoreViews)) {
       return failure();
     }

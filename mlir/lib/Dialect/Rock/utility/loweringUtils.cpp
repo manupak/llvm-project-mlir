@@ -238,11 +238,24 @@ FailureOr<RegsAsMatrixSubTiles> mlir::rock::getLoadRegsAsTileViews(
   return gpuViews;
 }
 
+static void makePackedRegsTidMerge(TopDownTMBuilder &viewBuilder,
+                                 StringRef dThreadName, int64_t dThreads,
+                                 int64_t kOuter, int64_t kOuterPerThread,
+                                 int64_t kPack, int64_t kPackPerThread,
+                                 ArrayRef<unsigned> outDims,
+                                 bool isKContigousDim) {
+  if (isKContigousDim) {
+    viewBuilder.merge({dThreadName, "k_thread", "kpack_thread"}, outDims, "tid", {dThreads, kOuter / kOuterPerThread, kPack / kPackPerThread});
+  } else {
+    viewBuilder.merge({"k_thread", "kpack_thread", dThreadName}, outDims, "tid", {kOuter / kOuterPerThread, kPack / kPackPerThread, dThreads});
+  }
+}
+
 FailureOr<RegsAsMatrixSubTiles> mlir::rock::getPackedRegsAsTileViews(
     OpBuilder &b, Location loc, Value globalBuffer, StringRef dName,
     ArrayRef<StringRef> bidGridOrder, ArrayRef<int64_t> bidGridLengths,
     int64_t blockSize, int64_t kPerBlock, int64_t dPerBlock, int64_t kPerThread,
-    int64_t dPerThread, int64_t kpack, bool isKContigousDim) {
+    int64_t dPerThread, int64_t kpack, int64_t kpacksPerBlock, bool isKContigousDim) {
   if (dName != "m" && dName != "n") {
     return emitError(loc, "expected dName to be m or n but got " + dName);
   }
@@ -262,7 +275,6 @@ FailureOr<RegsAsMatrixSubTiles> mlir::rock::getPackedRegsAsTileViews(
 
   // Note: (kThreads * dThreads) = (kPerBlock * dPerBlock) / dataPerThread) =
   // blockSize
-  int64_t kThreads = kPerBlock / kPerThread;
   int64_t dThreads = dPerBlock / dPerThread;
 
   int64_t kpackPerThread = std::min(kPerThread, kpack);
@@ -279,17 +291,19 @@ FailureOr<RegsAsMatrixSubTiles> mlir::rock::getPackedRegsAsTileViews(
         loc);
     gridwiseSplitId.passThrough(
         {"k_loop", bidGridOrder[0], bidGridOrder[1], bidGridOrder[2]});
-    makeLoadRegsTidMerge(gridwiseSplitId, dThreadName, dThreads, kThreads,
-                         {4, 5}, isKContigousDim);
+    makePackedRegsTidMerge(gridwiseSplitId, dThreadName, dThreads, kpacksPerBlock, kOuterPerThread, kpack, kpackPerThread, {4, 5, 6}, isKContigousDim);
     gridwiseSplitId.merge({"kouterPerThread", dIterName, "kpackPerThread"},
-                          {6, 7, 8}, "iter",
+                          {7, 8, 9}, "iter",
                           {kOuterPerThread, dPerThread, kpackPerThread});
     TransformMapAttr splitIdAttr = gridwiseSplitId.get();
     auto toGlobalIdx = TopDownTMBuilder::below(gridwiseSplitId, splitIdAttr);
     toGlobalIdx.passThrough({"g"}, {0}, {"g_block"});
-    toGlobalIdx.unmerge(
-        "k", 1, {"k_loop", "k_thread", "kouterPerThread", "kpackPerThread"},
-        {kGlobal / kPerBlock, kThreads, kOuterPerThread, kpackPerThread});
+    // toGlobalIdx.unmerge(
+    //     "k", 1, {"k_loop", "k_thread", "kouterPerThread", "kpack_thread", "kpackPerThread"},
+    //     {kGlobal / kPerBlock, kpacksPerBlock / kOuterPerThread, kOuterPerThread, kpack / kpackPerThread, kpackPerThread});
+    toGlobalIdx.unmerge("k", 1,
+                        {"k_thread", "kpack_thread", "kouterPerThread", "kpackPerThread"},
+                        {kpacksPerBlock / kOuterPerThread, kpack / kpackPerThread, kOuterPerThread, kpackPerThread});
     toGlobalIdx.unmerge(dName, 2, {thisBlockDim, dThreadName, dIterName},
                         {dGlobal / dPerBlock, dThreads, dPerThread});
     toGlobalIdx.ignore(otherBlockDim);
@@ -299,16 +313,18 @@ FailureOr<RegsAsMatrixSubTiles> mlir::rock::getPackedRegsAsTileViews(
   {
     TopDownTMBuilder blockwiseSplitId(b, {"tid", "iter"},
                                       {blockSize, dataPerThread}, loc);
-    makeLoadRegsTidMerge(blockwiseSplitId, dThreadName, dThreads, kThreads,
-                         {0, 1}, isKContigousDim);
+    makePackedRegsTidMerge(blockwiseSplitId, dThreadName, dThreads, kpacksPerBlock, kOuterPerThread, kpack, kpackPerThread, {0, 1, 2}, isKContigousDim);
     blockwiseSplitId.merge({"kouterPerThread", dIterName, "kpackPerThread"},
-                           {2, 3, 4}, "iter",
+                           {3, 4, 5}, "iter",
                            {kOuterPerThread, dPerThread, kpackPerThread});
     TransformMapAttr splitIdAttr = blockwiseSplitId.get();
     auto toGlobalIdx = TopDownTMBuilder::below(blockwiseSplitId, splitIdAttr);
+    // toGlobalIdx.unmerge("k", 0,
+    //                     {"k_thread", "kouterPerThread", "kpack_thread", "kpackPerThread"},
+    //                     {kpacksPerBlock / kOuterPerThread, kOuterPerThread, kpack / kpackPerThread, kpackPerThread});
     toGlobalIdx.unmerge("k", 0,
-                        {"k_thread", "kouterPerThread", "kpackPerThread"},
-                        {kThreads, kOuterPerThread, kpackPerThread});
+                        {"k_thread", "kpack_thread", "kouterPerThread", "kpackPerThread"},
+                        {kpacksPerBlock / kOuterPerThread, kpack / kpackPerThread, kOuterPerThread, kpackPerThread});
     toGlobalIdx.unmerge(dName, 1, {dThreadName, dIterName},
                         {dThreads, dPerThread});
     TransformMapAttr toGlobalIdxAttr = toGlobalIdx.get();
