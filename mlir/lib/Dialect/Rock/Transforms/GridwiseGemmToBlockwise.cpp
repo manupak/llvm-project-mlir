@@ -633,10 +633,10 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
     // vectorization Hence, creating the view w.r.t global that correspond to
     // such re-arranged register buffer
     FailureOr<RegsAsMatrixSubTiles> maybeALdsStoreViews =
-        getPackedRegsAsTileViews(
-            b, loc, op.getA(), "m", bidGridOrder, bidGridLengths, blockSize,
-            kPerBlock, mPerBlock, aCopyKPerThread, copyMPerThread, kpack,
-            kpacksPerBlock, aVectorDim == GemmDimension::K);
+        getPackedRegsAsTileViews(b, loc, op.getA(), "m", bidGridOrder,
+                                 bidGridLengths, blockSize, kPerBlock,
+                                 mPerBlock, aCopyKPerThread, copyMPerThread,
+                                 kpack, aVectorDim == GemmDimension::K);
     if (failed(maybeALdsStoreViews)) {
       return failure();
     }
@@ -652,10 +652,10 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
     // vectorization Hence, creating the view w.r.t global that correspond to
     // such re-arranged register buffer
     FailureOr<RegsAsMatrixSubTiles> maybeBLdsStoreViews =
-        getPackedRegsAsTileViews(
-            b, loc, op.getB(), "n", bidGridOrder, bidGridLengths, blockSize,
-            kPerBlock, nPerBlock, bCopyKPerThread, copyNPerThread, kpack,
-            kpacksPerBlock, bVectorDim == GemmDimension::K);
+        getPackedRegsAsTileViews(b, loc, op.getB(), "n", bidGridOrder,
+                                 bidGridLengths, blockSize, kPerBlock,
+                                 nPerBlock, bCopyKPerThread, copyNPerThread,
+                                 kpack, bVectorDim == GemmDimension::K);
     if (failed(maybeBLdsStoreViews)) {
       return failure();
     }
@@ -1006,10 +1006,10 @@ struct GridwiseGemmAccelRewritePattern
     // vectorization Hence, creating the view w.r.t global that correspond to
     // such re-arranged register buffer
     FailureOr<RegsAsMatrixSubTiles> maybeALdsStoreViews =
-        getPackedRegsAsTileViews(
-            b, loc, op.getA(), "m", bidGridOrder, bidGridLengths, blockSize,
-            kPerBlock, mPerBlock, aCopyKPerThread, copyMPerThread, kpack,
-            kpacksPerBlock, aVectorDim == GemmDimension::K);
+        getPackedRegsAsTileViews(b, loc, op.getA(), "m", bidGridOrder,
+                                 bidGridLengths, blockSize, kPerBlock,
+                                 mPerBlock, aCopyKPerThread, copyMPerThread,
+                                 kpack, aVectorDim == GemmDimension::K);
     if (failed(maybeALdsStoreViews)) {
       return failure();
     }
@@ -1025,10 +1025,10 @@ struct GridwiseGemmAccelRewritePattern
     // vectorization Hence, creating the view w.r.t global that correspond to
     // such re-arranged register buffer
     FailureOr<RegsAsMatrixSubTiles> maybeBLdsStoreViews =
-        getPackedRegsAsTileViews(
-            b, loc, op.getB(), "n", bidGridOrder, bidGridLengths, blockSize,
-            kPerBlock, nPerBlock, bCopyKPerThread, copyNPerThread, kpack,
-            kpacksPerBlock, bVectorDim == GemmDimension::K);
+        getPackedRegsAsTileViews(b, loc, op.getB(), "n", bidGridOrder,
+                                 bidGridLengths, blockSize, kPerBlock,
+                                 nPerBlock, bCopyKPerThread, copyNPerThread,
+                                 kpack, bVectorDim == GemmDimension::K);
     if (failed(maybeBLdsStoreViews)) {
       return failure();
     }
