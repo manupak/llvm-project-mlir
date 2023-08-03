@@ -624,13 +624,13 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
         /*extraIndices=*/
         ValueRange{/*kIter=*/zeroConstantOp, gridCoords.g_block,
                    gridCoords.m_block, gridCoords.n_block, tid},
-        true, true);
+        /*forceVecLen=*/b.getI32IntegerAttr(aVectorLen), true, true);
     b.create<ThreadwiseReadIntoOp>(
         loc, wrappedB, loadBufferB, /*extraViews=*/b.getArrayAttr({}),
         /*extraIndices=*/
         ValueRange{/*kIter=*/zeroConstantOp, gridCoords.g_block,
                    gridCoords.m_block, gridCoords.n_block, tid},
-        true, true);
+        /*forceVecLen=*/b.getI32IntegerAttr(bVectorLen), true, true);
 
     ArrayAttr aVectorLdsMap = ldsVectorLayout(b, loc, aCopyPerThread);
     ArrayAttr bVectorLdsMap = ldsVectorLayout(b, loc, bCopyPerThread);
@@ -733,13 +733,13 @@ struct GridwiseGemmRewritePattern : public OpRewritePattern<GridwiseGemmOp> {
           /*extraIndices=*/
           ValueRange{/*kIter=*/iv, gridCoords.g_block, gridCoords.m_block,
                      gridCoords.n_block, tid},
-          true, true);
+          /*forceVecLen=*/b.getI32IntegerAttr(aVectorLen), true, true);
       b.create<ThreadwiseReadIntoOp>(
           loc, wrappedB, loadBufferB, /*extraViews=*/b.getArrayAttr({}),
           /*extraIndices=*/
           ValueRange{/*kIter=*/iv, gridCoords.g_block, gridCoords.m_block,
                      gridCoords.n_block, tid},
-          true, true);
+          /*forceVecLen=*/b.getI32IntegerAttr(bVectorLen), true, true);
 
       // LDS barrier.
       b.create<LDSBarrierOp>(loc);
@@ -1790,13 +1790,13 @@ struct GridwiseGemmAccelRewritePattern
         /*extraIndices=*/
         ValueRange{/*kIter=*/zeroConstantOp, gridCoords.g_block,
                    gridCoords.m_block, gridCoords.n_block, tid},
-        true, true);
+        /*forceVecLen=*/b.getI32IntegerAttr(aVectorLen), true, true);
     b.create<ThreadwiseReadIntoOp>(
         loc, wrappedB, loadBufferB, /*extraViews=*/b.getArrayAttr({}),
         /*extraIndices=*/
         ValueRange{/*kIter=*/zeroConstantOp, gridCoords.g_block,
                    gridCoords.m_block, gridCoords.n_block, tid},
-        true, true);
+        /*forceVecLen=*/b.getI32IntegerAttr(bVectorLen), true, true);
 
     Value storeBufferA = b.create<GpuAllocOp>(loc, loadBufferA.getType());
     Value storeBufferB = b.create<GpuAllocOp>(loc, loadBufferB.getType());
@@ -2006,13 +2006,13 @@ struct GridwiseGemmAccelRewritePattern
           /*extraIndices=*/
           ValueRange{/*kIter=*/iv, gridCoords.g_block, gridCoords.m_block,
                      gridCoords.n_block, tid},
-          true, true);
+          /*forceVecLen=*/b.getI32IntegerAttr(aVectorLen), true, true);
       b.create<ThreadwiseReadIntoOp>(
           loc, wrappedB, loadBufferB, /*extraViews=*/b.getArrayAttr({}),
           /*extraIndices=*/
           ValueRange{/*kIter=*/iv, gridCoords.g_block, gridCoords.m_block,
                      gridCoords.n_block, tid},
-          true, true);
+          /*forceVecLen=*/b.getI32IntegerAttr(bVectorLen), true, true);
 
       // LDS barrier.
       b.create<LDSBarrierOp>(loc);

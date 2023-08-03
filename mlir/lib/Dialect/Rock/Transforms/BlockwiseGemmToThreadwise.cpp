@@ -752,8 +752,13 @@ LogicalResult ThreadwiseReadIntoRewritePattern::matchAndRewrite(
 
   // We are vectorizing in the iter dimension, not block ID or thread ID
   auto elementType = sourceView.getType().getElementType();
-  int64_t vectorLen = getMaxVectorizationForDatatype(
-      transforms, /*dim=*/extraIdxCount, numValues, bufferShape, elementType);
+  int64_t vectorLen = 1;
+  if (op.getForceVecLen().has_value()) {
+    vectorLen = op.getForceVecLen().value();
+  } else {
+    vectorLen = getMaxVectorizationForDatatype(
+        transforms, /*dim=*/extraIdxCount, numValues, bufferShape, elementType);
+  }
   LLVM_DEBUG(llvm::dbgs() << "Max vectorization for read_into = " << vectorLen
                           << "\n");
 
@@ -1272,7 +1277,8 @@ struct BlockwiseReduceRewritePattern
             loc, rewriter, inputViewArrayAttr, axis, /*makeRDimZero-*/ true);
         rewriter.create<ThreadwiseReadIntoOp>(
             loc, workspaceLDSBuffer, outputReg, reducedldsViewArrayAttr,
-            /*extraIndices=*/ValueRange{tid}, true, true);
+            /*extraIndices=*/ValueRange{tid}, /*forceVecLen=*/nullptr, true,
+            true);
       } else {
         // This means there are more threads than elements to be reduced.
         ArrayAttr threadToTensorViewTrs =
@@ -1428,7 +1434,8 @@ struct BlockwiseReduceRewritePattern
               loc, rewriter, inputViewArrayAttr, axis, /*makeRDimZero-*/ true);
           rewriter.create<ThreadwiseReadIntoOp>(
               loc, workspaceLDSBuffer, outputReg, reducedldsViewArrayAttr,
-              /*extraIndices=*/ValueRange{tid}, true, true);
+              /*extraIndices=*/ValueRange{tid}, /*forceVecLen=*/nullptr, true,
+              true);
         }
       }
       rewriter.eraseOp(op);
