@@ -859,29 +859,37 @@ def runConfigWithMLIR(config: PerfConfiguration, paths: Paths, rocmlir_gen_flags
         print("Running MLIR Benchmark: ", repr(config))
     rocmlirGenCommand = paths.mlir_paths.rocmlir_gen_path + ' -ph ' + commandLineOptions
     rocmlirDriverCommand = [paths.mlir_paths.rocmlir_driver_path, '-c']
+    print(f"{rocmlirGenCommand} | {rocmlirDriverCommand}")
     mlir_cpu_runner_args = [f'--shared-libs={paths.mlir_paths.libmlir_rocm_runtime_path},{paths.mlir_paths.libconv_validation_wrappers_path},{paths.mlir_paths.libmlir_runtime_utils_path}', '--entry-point-result=void']
     profilerCommand = [ROCPROF, '--stats', paths.mlir_paths.cpu_runner_path] + mlir_cpu_runner_args
 
-    # invoke rocmlir-gen.
-    p1 = subprocess.Popen(rocmlirGenCommand.split(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    # pipe to rocmlir-driver
-    p2 = subprocess.Popen(rocmlirDriverCommand, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    p1.stdout.close() # Allow p1 to receive a SIGPIPE if p2 exits.
-    # pipe to rocprof + mlir-cpu-runner.
-    p3 = subprocess.Popen(profilerCommand, stdin=p2.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    p2.stdout.close() # Allow p2 to receive a SIGPIPE if p3 exits.
-    # get output.
-    try:
-        outs, errs = p3.communicate(timeout=60)
-        if len(errs) > 0:
-            print("Test printed errors: ", errs.decode('utf-8'))
-            print("Failing command line: ", rocmlirGenCommand)
-            if p1.returncode != 0:
-                raise OSError(errs.decode('utf-8'))
-    except subprocess.TimeoutExpired:
-        print("Test timed out: ", rocmlirGenCommand)
-        p3.kill()
-        outs, errs = p3.communicate()
+    
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="a+", delete=False) as stderr:
+        # invoke rocmlir-gen.
+        p1 = subprocess.Popen(rocmlirGenCommand.split(), stdout=subprocess.PIPE, stderr=stderr)
+        # pipe to rocmlir-driver
+        p2 = subprocess.Popen(rocmlirDriverCommand, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=stderr)
+        p1.stdout.close() # Allow p1 to receive a SIGPIPE if p2 exits.
+        # pipe to rocprof + mlir-cpu-runner.
+        p3 = subprocess.Popen(profilerCommand, stdin=p2.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p2.stdout.close() # Allow p2 to receive a SIGPIPE if p3 exits.
+        # get output.
+        try:
+            outs, errs = p3.communicate(timeout=60)
+            stderr.seek(0)
+            stderr_contents = stderr.read()
+            print("Stderr contents:")
+            print(stderr_contents)
+            if len(errs) > 0:
+                print("Test printed errors: ", errs.decode('utf-8'))
+                print("Failing command line: ", rocmlirGenCommand)
+                if p1.returncode != 0:
+                    raise OSError(errs.decode('utf-8'))
+        except subprocess.TimeoutExpired:
+            print("Test timed out: ", rocmlirGenCommand)
+            p3.kill()
+            outs, errs = p3.communicate()
 
 # Benchmarking function.
 def benchmarkMLIR(commandLine, confClass, paths: Paths, arch, numCU, tuningDb: MaybeTuningDb, rocmlir_gen_flags):
