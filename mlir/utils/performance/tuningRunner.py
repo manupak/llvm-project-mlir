@@ -122,7 +122,7 @@ def tuneMLIRKernels(configs, confClass, paths: Paths, options: Options):
     for testVector in configs:
         commandLine = testVector.split(sep=' ')
         config = confClass.fromCommandLine(commandLine, options.arch, options.numCU)
-        config.MLIR_N_REPEATS=5
+        config.MLIR_N_REPEATS=1
         print("Tuning:", testVector)
         commandLineOptions = config.generateMlirDriverCommandLine(options.rocmlir_gen_flags)
         # Note, we don't need the -ph, this goes to the tuning driver
