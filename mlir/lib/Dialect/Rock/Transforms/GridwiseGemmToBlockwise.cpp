@@ -1093,20 +1093,25 @@ struct GridwiseAttentionAccelRewritePattern
   // where its divided by the accumulated rowsum
   void scaleFinalOutput(PatternRewriter &rewriter, Location loc,
                         Value attentionOutAccBufferView,
-                        Value sumRowBuffer) const {
-    Value attentionOutAccBuffer;
-    ArrayAttr attentionOutAccTrs;
+                        Value sumRowBuffer,
+                        Value attentionOutAccBufferOutTypedView) const {
+    Value attentionOutAccBuffer, attentionOutAccBufferOutTyped;
+    ArrayAttr attentionOutAccTrs, attentionOutAccOutTypedTrs;
     std::tie(attentionOutAccBuffer, attentionOutAccTrs, std::ignore) =
         untransform(rewriter, attentionOutAccBufferView);
+    std::tie(attentionOutAccBufferOutTyped, attentionOutAccOutTypedTrs, std::ignore) =
+        untransform(rewriter, attentionOutAccBufferOutTypedView);
     MemRefType attentionOutAccViewType =
         attentionOutAccBufferView.getType().cast<MemRefType>();
+    MemRefType attentionOutAccOutTypedViewType =
+        attentionOutAccBufferOutTypedView.getType().cast<MemRefType>();
     Type outElemType = attentionOutAccViewType.getElementType();
     int64_t g1Mpt = attentionOutAccViewType.getShape()[0];
     int64_t g1Npt = attentionOutAccViewType.getShape()[1];
     Value zero = rewriter.createOrFold<ConstantIndexOp>(loc, 0);
     auto loop = rewriter.create<TransformingForOp>(
-        loc, ArrayRef<ValueRange>{{zero, zero}, {zero, zero}},
-        ArrayRef<Attribute>{rewriter.getArrayAttr({}), attentionOutAccTrs},
+        loc, ArrayRef<ValueRange>{{zero, zero}, {zero, zero}, {zero, zero}},
+        ArrayRef<Attribute>{rewriter.getArrayAttr({}), attentionOutAccTrs, attentionOutAccOutTypedTrs},
         /*bounds=*/ArrayRef<int64_t>{g1Mpt, g1Npt},
         /*strides=*/ArrayRef<int64_t>{1, 1},
         /*useIndexDiffs=*/true, /*forceUnroll=*/true);
@@ -1116,16 +1121,26 @@ struct GridwiseAttentionAccelRewritePattern
       Block::BlockArgListType upperCoords = loop.getLowerCoords(0);
       Block::BlockArgListType attentionOutAccBufferCoords =
           loop.getLowerCoords(1);
+      Block::BlockArgListType attentionOutAccBufferOutTypedCoords =
+          loop.getLowerCoords(2);
       Value ldAttentionOutAccBuffer = rewriter.create<InBoundsLoadOp>(
           loc, outElemType, attentionOutAccBuffer, attentionOutAccBufferCoords);
       Type sumRowBufferElemType = getElementTypeOrSelf(sumRowBuffer.getType());
       Value ldSumRowBuffer = rewriter.create<InBoundsLoadOp>(
           loc, sumRowBufferElemType, sumRowBuffer, ValueRange{upperCoords[0]});
+      if(ldSumRowBuffer.getType() != ldAttentionOutAccBuffer.getType()){
+        ldSumRowBuffer = createTypeConversionOp(rewriter, loc, ldSumRowBuffer,
+                                                ldAttentionOutAccBuffer.getType());
+      }
       Value stAttentionOutAccBuffer = rewriter.create<arith::DivFOp>(
           loc, ldAttentionOutAccBuffer, ldSumRowBuffer);
+      if(attentionOutAccOutTypedViewType.getElementType() != stAttentionOutAccBuffer.getType()){
+        stAttentionOutAccBuffer = createTypeConversionOp(rewriter, loc, stAttentionOutAccBuffer,
+                                  attentionOutAccOutTypedViewType.getElementType());
+      }
       rewriter.create<InBoundsStoreOp>(loc, stAttentionOutAccBuffer,
-                                       attentionOutAccBuffer,
-                                       attentionOutAccBufferCoords);
+                                       attentionOutAccBufferOutTyped,
+                                       attentionOutAccBufferOutTypedCoords);
     }
   }
 
@@ -1161,6 +1176,8 @@ struct GridwiseAttentionAccelRewritePattern
 
     MemRefType attentionOutAccBufferType =
         attentionOutAccBufferView.getType().cast<MemRefType>();
+    MemRefType gemm1OutType =
+        gemm1OutThreadwiseView.getType().cast<MemRefType>();
     Type outElemType = attentionOutAccBufferType.getElementType();
     int64_t g1Mpt = attentionOutAccBufferType.getShape()[0];
     int64_t g1Npt = attentionOutAccBufferType.getShape()[1];
@@ -1202,19 +1219,28 @@ struct GridwiseAttentionAccelRewritePattern
 
       Value maxRowDiff =
           rewriter.create<arith::SubFOp>(loc, ldMaxRowBuffer, maxRowBufferNew);
-      Value maxRowDiffInvExp = rewriter.create<math::ExpOp>(loc, maxRowDiff);
+      Value maxRowDiffExp = rewriter.create<math::ExpOp>(loc, maxRowDiff);
+      // Correct O
       Value ldAttentionOutAccBuffer = rewriter.create<InBoundsLoadOp>(
           loc, outElemType, attentionOutAccBuffer, attentionOutAccBufferCoords);
+      if(ldAttentionOutAccBuffer.getType() != maxRowDiffExp.getType()){
+        maxRowDiffExp = createTypeConversionOp(rewriter, loc, maxRowDiffExp,
+                                               ldAttentionOutAccBuffer.getType());
+      }
       Value scaledldAttentionOutAccBuffer = rewriter.create<arith::MulFOp>(
-          loc, ldAttentionOutAccBuffer, maxRowDiffInvExp);
-
+          loc, ldAttentionOutAccBuffer, maxRowDiffExp);
       Value ldGemm1Out = rewriter.create<InBoundsLoadOp>(
-          loc, outElemType, gemm1Out, gemm1OutCoords);
+          loc, gemm1OutType.getElementType(), gemm1Out, gemm1OutCoords);
+      if(scaledldAttentionOutAccBuffer.getType() != ldGemm1Out.getType()){
+        ldGemm1Out = createTypeConversionOp(rewriter, loc, ldGemm1Out,
+                                            scaledldAttentionOutAccBuffer.getType());
+      }
       Value stAttentionOutAccBuffer = rewriter.create<arith::AddFOp>(
           loc, scaledldAttentionOutAccBuffer, ldGemm1Out);
       rewriter.create<InBoundsStoreOp>(loc, stAttentionOutAccBuffer,
                                        attentionOutAccBuffer,
                                        attentionOutAccBufferCoords);
+      // Update running max
       Value isNptLastIdx = rewriter.create<arith::CmpIOp>(
           loc, arith::CmpIPredicate::eq, upperCoords[1], lastNptIdx);
       scf::IfOp ifb = rewriter.create<scf::IfOp>(loc, isNptLastIdx,
@@ -1688,10 +1714,11 @@ struct GridwiseAttentionAccelRewritePattern
 
     // o buffer; this is exactly same as gemm1OutBuffer;
     // we just need another buffer to do the special accumulation
+    Type attentionOutAccElemType = rewriter.getF32Type();
     Value attentionOutAccBuffer =
-        createBufferForGemmOut(loc, elemTypeQxK, accelParamsGemm1, rewriter);
+        createBufferForGemmOut(loc, attentionOutAccElemType, accelParamsGemm1, rewriter);
     Value attentionOutAccBufferOutTyped = attentionOutAccBuffer;
-    if (elemTypeQxK != elemTypeOut) {
+    if (attentionOutAccElemType != elemTypeOut) {
       attentionOutAccBufferOutTyped =
           createBufferForGemmOut(loc, elemTypeOut, accelParamsGemm1, rewriter);
     }
@@ -1699,6 +1726,9 @@ struct GridwiseAttentionAccelRewritePattern
         invertTransforms(rewriter, loc, gemm1OutSubTileViews.threadSubTile);
     Value attentionOutAccBufferView =
         transform(rewriter, attentionOutAccBuffer,
+                  attentionOutAccBufferThreadSubTileViewMaps);
+    Value attentionOutAccBufferOutTypedView =
+        transform(rewriter, attentionOutAccBufferOutTyped,
                   attentionOutAccBufferThreadSubTileViewMaps);
     // m buffer; this only contains a reduced single value per row
     auto reducedBufferType =
@@ -2016,11 +2046,11 @@ struct GridwiseAttentionAccelRewritePattern
             attentionOutAccBufferView, maxRowBuffer, nLoopIV);
       }
     }
-    scaleFinalOutput(rewriter, loc, attentionOutAccBufferView, sumRowBuffer);
-    if (elemTypeQxK != elemTypeOut) {
-      createTypeConversionLaGeneric(rewriter, loc, attentionOutAccBuffer,
-                                    attentionOutAccBufferOutTyped);
-    }
+    scaleFinalOutput(rewriter, loc, attentionOutAccBufferView, sumRowBuffer, attentionOutAccBufferOutTypedView);
+    // if (elemTypeQxK != elemTypeOut) {
+    //   createTypeConversionLaGeneric(rewriter, loc, attentionOutAccBuffer,
+    //                                 attentionOutAccBufferOutTyped);
+    // }
 #ifdef ROCK_DEBUG_ATTENTION_REMOVE_SOFTMAX
     attentionOutAccBufferOutTyped = gemm1OutBuffer;
 #endif
