@@ -823,6 +823,32 @@ struct AttentionRewritePattern : public OpRewritePattern<tosa::MatMulOp> {
     }
   }
 
+  FailureOr<Value> maybeGetDequantizeSoftmaxIn(Value val) const {
+    auto cast = getDefiningNonReshapeOp<tosa::CastOp>(val);
+    if(!cast){
+      return failure();
+    }
+    auto mul = getDefiningNonReshapeOp<tosa::MulOp>(cast);
+    if (!mul) {
+      return failure();
+    }
+    auto maybeIn1Softmax = maybeSoftmax(mul.getInput1());
+    if(succeeded(maybeIn1Softmax)){
+      auto recip = getDefiningNonReshapeOp<tosa::ReciprocalOp>(maybeIn1Softmax.value());
+      if(recip){
+        return recip.getResult();
+      }
+    }
+    auto maybeIn2Softmax = maybeSoftmax(mul.getInput2());
+    if(succeeded(maybeIn2Softmax)){
+      auto recip = getDefiningNonReshapeOp<tosa::ReciprocalOp>(maybeIn2Softmax.value());
+      if(recip){
+        return recip.getResult();
+      }
+    }
+    return failure();
+  }
+
   Value normalizeInputTensor(PatternRewriter &rewriter, Location loc,
                              TypedValue<TensorType> inputTensor) const {
     if (!inputTensor) {
