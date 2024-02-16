@@ -1456,14 +1456,13 @@ struct GridwiseAttentionAccelRewritePattern
   }
 
   FailureOr<Value> postProcessFirstGemm(
-      PatternRewriter &rewriter, Location loc, GridwiseAttentionAccelOp op,
+      PatternRewriter &rewriter, Location loc, linalg::GenericOp genOp,
       layout::GridCoordinates gridCoords, Value srcGemm0OutBuffer,
       Value destGemm0OutBuffer, RegsAsMatrixSubTiles gemm0OutViews) const {
     LogicalResult res = success();
     auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(
         gpu::GPUDialect::getPrivateAddressSpace());
     bool linalgOpFound = false;
-    op.getPreSoftmaxBody().walk([&](linalg::GenericOp genOp) {
       linalgOpFound = true;
       auto tid = rewriter.create<WorkitemIdOp>(loc, rewriter.getIndexType());
       SmallVector<Value> inputTileBuffers;
@@ -1536,7 +1535,6 @@ struct GridwiseAttentionAccelRewritePattern
           1, linalg::IteratorTypeAttr::get(rewriter.getContext(),
                                            utils::IteratorType::parallel));
       newLinalgOp.setIteratorTypesAttr(rewriter.getArrayAttr(iteratorTypes));
-    });
     if (failed(res)) {
       return op.emitError("pre softmax linalg regularization failed.\n");
     }

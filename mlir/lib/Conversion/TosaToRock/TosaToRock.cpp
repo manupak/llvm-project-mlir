@@ -807,7 +807,7 @@ struct AttentionRewritePattern : public OpRewritePattern<tosa::MatMulOp> {
     return maybeSoftmaxNumerator(rsum.getInput());
   }
 
-  FailureOr<Value> maybeSoftmax(Value val) const {
+  FailureOr<Value> maybeGetFloatSoftmax(Value val) const {
     auto mul = getDefiningNonReshapeOp<tosa::MulOp>(val);
     if (!mul) {
       return failure();
@@ -823,30 +823,44 @@ struct AttentionRewritePattern : public OpRewritePattern<tosa::MatMulOp> {
     }
   }
 
-  FailureOr<Value> maybeGetDequantizeSoftmaxIn(Value val) const {
+  std::tuple<FailureOr<Value>, Value> maybeGetQuantizeSoftmax(Value val) const {
     auto cast = getDefiningNonReshapeOp<tosa::CastOp>(val);
     if(!cast){
-      return failure();
+      return {failure(), Value()};
     }
-    auto mul = getDefiningNonReshapeOp<tosa::MulOp>(cast);
+    auto mul = getDefiningNonReshapeOp<tosa::MulOp>(cast.getInput());
     if (!mul) {
-      return failure();
+      return {failure(), Value()};
     }
-    auto maybeIn1Softmax = maybeSoftmax(mul.getInput1());
+    FailureOr<Value> maybeIn1Softmax = maybeGetFloatSoftmax(mul.getInput1());
     if(succeeded(maybeIn1Softmax)){
-      auto recip = getDefiningNonReshapeOp<tosa::ReciprocalOp>(maybeIn1Softmax.value());
-      if(recip){
-        return recip.getResult();
+      auto recip = getDefiningNonReshapeOp<tosa::ReciprocalOp>(mul.getInput2());
+      if(!recip){
+        return {failure(), Value()};
       }
+      return {maybeIn1Softmax, recip};
     }
-    auto maybeIn2Softmax = maybeSoftmax(mul.getInput2());
+    FailureOr<Value> maybeIn2Softmax = maybeGetFloatSoftmax(mul.getInput2());
     if(succeeded(maybeIn2Softmax)){
-      auto recip = getDefiningNonReshapeOp<tosa::ReciprocalOp>(maybeIn2Softmax.value());
-      if(recip){
-        return recip.getResult();
+      auto recip = getDefiningNonReshapeOp<tosa::ReciprocalOp>(mul.getInput1());
+      if(!recip){
+        return {failure(), Value()};
       }
+      return {maybeIn2Softmax, recip};
     }
-    return failure();
+    return {failure(), Value()};
+  }
+
+  std::tuple<FailureOr<Value>, Value> maybeSoftmax(Value val) const {
+    auto [maybeDequantSoftmax, recipQuantScales] = maybeGetQuantizeSoftmax(val);
+    if(succeeded(maybeDequantSoftmax)){
+      return {maybeDequantSoftmax, recipQuantScales};
+    }
+    FailureOr<Value> maybeFloatSoftmax = maybeGetFloatSoftmax(val);
+    if(succeeded(maybeFloatSoftmax)){
+      return {maybeFloatSoftmax, Value()};
+    }
+    return {failure(), Value()};
   }
 
   Value normalizeInputTensor(PatternRewriter &rewriter, Location loc,
@@ -954,7 +968,7 @@ struct AttentionRewritePattern : public OpRewritePattern<tosa::MatMulOp> {
   }
 
   LogicalResult match(tosa::MatMulOp op) const override {
-    FailureOr<Value> softmaxInput = maybeSoftmax(op.getA());
+    auto [softmaxInput, recipQuantScale] = maybeSoftmax(op.getA());
     if (failed(softmaxInput)) {
       return failure();
     }
@@ -968,7 +982,8 @@ struct AttentionRewritePattern : public OpRewritePattern<tosa::MatMulOp> {
 
   void rewrite(tosa::MatMulOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value softmaxInput = maybeSoftmax(op.getA()).value();
+    auto [maybeSoftmaxInput, recipQuantScale] = maybeSoftmax(op.getA());
+    Value softmaxInput = maybeSoftmaxInput.value();
     auto outputType = op.getType().template cast<RankedTensorType>();
     Value output = rewriter.create<bufferization::AllocTensorOp>(
         loc, outputType, ValueRange{});
@@ -985,7 +1000,7 @@ struct AttentionRewritePattern : public OpRewritePattern<tosa::MatMulOp> {
     tosa::MatMulOp firstMatMulOp = maybeFirstMatMul.value();
     rock::AttentionOp attnOp = rewriter.create<rock::AttentionOp>(
         loc, outputType, firstMatMulOp.getA(), firstMatMulOp.getB(), op.getB(),
-        elemwiseOtherArgs, output,
+        elemwiseOtherArgs, recipQuantScale, output,
         // TODO(implement transpose fusion support here)
         /*qTransposed=*/nullptr,
         /*kTransposed=*/nullptr,

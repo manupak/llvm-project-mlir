@@ -2343,7 +2343,7 @@ static func::FuncOp createGpuAttentionKernel(ModuleOp module,
   output = block->getArgument(optionalArgsCounter);
 
   auto attention = builder.create<rock::AttentionOp>(
-      loc, TypeRange{}, queries, keys, values, elemwiseInputs, output,
+      loc, TypeRange{}, queries, keys, values, elemwiseInputs, nullptr, output,
       transposeQ, transposeK, transposeV, transposeO, archAttr, params.features,
       /*params0=*/nullptr, /*params1=*/nullptr);
   {

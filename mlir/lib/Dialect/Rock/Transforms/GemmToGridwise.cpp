@@ -307,7 +307,7 @@ AttentionRewritePattern::matchAndRewrite(AttentionOp op,
     prePadG0NAttr = rw.getIndexAttr(gemm0Size.n);
   }
   auto newOp = rw.create<GridwiseAttentionAccelOp>(
-      loc, queries, keys, values, adaptor.getPreSoftmaxElemWiseInputs(), out,
+      loc, queries, keys, values, adaptor.getPreSoftmaxElemWiseInputs(), adaptor.getQkQuantScale(), out,
       op.getArchAttr(), op.getFeaturesAttr(), blockSizeAttr, gridSizeAttr,
       /*disableQBypassLDS=*/nullptr, prePadG0MAttr, prePadG0NAttr, params0,
       params1);

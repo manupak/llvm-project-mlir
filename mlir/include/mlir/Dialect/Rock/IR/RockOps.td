@@ -204,13 +204,14 @@ def Rock_ReduceOp :
 }
 
 def Rock_AttentionOp :
-  Rock_Op<"attention">,
+  Rock_Op<"attention", [AttrSizedOperandSegments]>,
   Arguments<(ins
     Arg<TensorOrMemRefOf<[F32, F16, I8]>, "queries", [MemRead]>:$queries,
     Arg<TensorOrMemRefOf<[F32, F16, I8]>, "keys", [MemRead]>:$keys,
-    Arg<TensorOrMemRefOf<[F32, F16]>, "values", [MemRead]>:$values,
+    Arg<TensorOrMemRefOf<[F32, F16, I8]>, "values", [MemRead]>:$values,
     Variadic<TensorOrMemRefOf<[F32, F16, I8]>>:$preSoftmaxElemWiseInputs,
-    Arg<TensorOrMemRefOf<[F32, F16]>, "output", [MemRead, MemWrite]>:$out,
+    Optional<TensorOrMemRefOf<[F32, F16]>>:$qkQuantScale,
+    Arg<TensorOrMemRefOf<[F32, F16, I32]>, "output", [MemRead, MemWrite]>:$out,
     UnitAttr:$qTransposed,
     UnitAttr:$kTransposed,
     UnitAttr:$vTransposed,
@@ -220,7 +221,7 @@ def Rock_AttentionOp :
     OptionalAttr<RockTuningParamAttrInterface>:$params0,
     OptionalAttr<RockTuningParamAttrInterface>:$params1
   )>,
-  Results<(outs Optional<TensorOf<[F32, F16]>>:$result)> {
+  Results<(outs Optional<TensorOf<[F32, F16, I32]>>:$result)> {
   let summary = "Attention operation of transformer models";
   let description = [{
     Performs the operation out = SOFTMAX((queries * keys) .* scale) * values.
@@ -241,6 +242,7 @@ def Rock_AttentionOp :
     `{` `\n`
         ` ` `qk` `=` (`tr` $qTransposed^)? $queries `*` (`tr` $kTransposed^)? $keys `:` type($queries) `,` type($keys) `\n`
         (`qk` `=` `elementwise` `otherIns` `(` $preSoftmaxElemWiseInputs^ `:` type($preSoftmaxElemWiseInputs) `)` $preSoftmaxBody `\n`)?
+        (`qk` `=` `quantize` `scale` `(` $qkQuantScale^ `)` `:` type($qkQuantScale) `\n`)?
         (`tr` $oTransposed^)? $out `=` `softmax` `(` `qk` `)` `*` (`tr` $vTransposed^)? $values `:` type($values) `->` type($out) `\n`
     `}` attr-dict (`->` type($result)^)?
   }];
@@ -426,12 +428,13 @@ def Rock_GridwiseGemmAccelOp :
 
 // gridwise_attention_accel
 def Rock_GridwiseAttentionAccelOp :
-    Rock_Op<"gridwise_attention_accel">,
+    Rock_Op<"gridwise_attention_accel", [AttrSizedOperandSegments]>,
     Arguments<(ins MemRefRankOf<[F32, F16, I8], [3]>:$queries,
                    MemRefRankOf<[F32, F16, I8], [3]>:$keys,
-                   MemRefRankOf<[F32, F16], [3]>:$values,
+                   MemRefRankOf<[F32, F16, I8], [3]>:$values,
                    Variadic<TensorOrMemRefOf<[F32, F16, I8]>>:$preSoftmaxElemWiseInputs,
-                   MemRefRankOf<[F32, F16], [3]>:$out,
+                   Optional<TensorOrMemRefOf<[F32, F16]>>:$qkQuantScale,
+                   MemRefRankOf<[F32, F16, I32], [3]>:$out,
                    StrAttr:$arch,
                    Rock_GemmFeaturesAttr:$features,
                    I32Attr:$blockSize,
