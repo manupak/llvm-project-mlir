@@ -200,6 +200,7 @@ computeOptimalSplitKFactors(RockGemmWrapperInterface gemmOp,
 // such configs can be 2 orders of magnitude slower.
 bool canSkipConfigForReductionFusion(RockGemmWrapperInterface gemmOp,
                                      int64_t mPerBlock, int64_t nPerBlock) {
+  return false;
   func::FuncOp func = gemmOp->getParentOfType<func::FuncOp>();
   WalkResult wRes = func.walk(
       [&](ReduceOp rOp) -> WalkResult { return WalkResult::interrupt(); });

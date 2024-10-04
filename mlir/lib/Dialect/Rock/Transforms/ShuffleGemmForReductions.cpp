@@ -476,31 +476,36 @@ ArrayAttr generateShuffledGemmOutputViews(
       {reductionSplit, combinedReduction, splitOriginalSubDims, recombineMN});
 }
 
-static bool isPaddingMap(TransformMapAttr trMap){
-  for(auto trOp : trMap.getOps()){
-    if(trOp.getType() == TransformType::PassThrough) continue;
-    if(trOp.getType() == TransformType::Pad) continue;
+static bool isPaddingMap(TransformMapAttr trMap) {
+  for (auto trOp : trMap.getOps()) {
+    if (trOp.getType() == TransformType::PassThrough)
+      continue;
+    if (trOp.getType() == TransformType::Pad)
+      continue;
     return false;
   }
   return true;
 }
 
-static std::tuple<TypedValue<MemRefType>, TransformMapAttr> getSourceViewifPaddingOnly(TypedValue<MemRefType> val){
-  if(TransformOp view = dyn_cast<TransformOp>(val.getDefiningOp())){
-    if(isPaddingMap(view.getTransform())){
-      return {cast<TypedValue<MemRefType>>(view.getViewSource()), view.getTransform()};
+static std::tuple<TypedValue<MemRefType>, TransformMapAttr>
+getSourceViewifPaddingOnly(TypedValue<MemRefType> val) {
+  if (TransformOp view = dyn_cast<TransformOp>(val.getDefiningOp())) {
+    if (isPaddingMap(view.getTransform())) {
+      return {cast<TypedValue<MemRefType>>(view.getViewSource()),
+              view.getTransform()};
     }
   }
   return {val, nullptr};
 }
 
-static FailureOr<std::tuple<ArrayAttr, TransformMapAttr>> stripFirstPadAttr(ArrayAttr views){
+static FailureOr<std::tuple<ArrayAttr, TransformMapAttr>>
+stripFirstPadAttr(ArrayAttr views) {
   TransformMapAttr firstTr = cast<TransformMapAttr>(views[0]);
-  if(!isPaddingMap(firstTr)){
+  if (!isPaddingMap(firstTr)) {
     return failure();
   }
   SmallVector<Attribute> strippedArr;
-  for(int i = 1; i < views.size(); i++){
+  for (size_t i = 1; i < views.size(); i++) {
     strippedArr.push_back(views[i]);
   }
   IRRewriter rewriter(views.getContext());
@@ -523,7 +528,7 @@ rearrangeGemmParallelDimsForReduction(ReduceOp rOp,
     LLVM_DEBUG(llvm::dbgs() << "gemmToReduceViews=" << views << "\n");
     auto maybeStripedViews = stripFirstPadAttr(views);
     TransformMapAttr firstPaddedTr;
-    if(succeeded(maybeStripedViews)){
+    if (succeeded(maybeStripedViews)) {
       std::tie(views, firstPaddedTr) = maybeStripedViews.value();
     }
     FailureOr<MNPerBlock> mnPerBlock = getMNPerBlock(gemmOp);
@@ -555,14 +560,20 @@ rearrangeGemmParallelDimsForReduction(ReduceOp rOp,
     TransformMapAttr maybePadOut;
     if (GridwiseGemmAccelOp gemmAccelOp =
             dyn_cast<GridwiseGemmAccelOp>(gemmOp)) {
-      std::tie(gemmInA, maybePadA) = getSourceViewifPaddingOnly(gemmAccelOp.getA());
-      std::tie(gemmInB, maybePadB) = getSourceViewifPaddingOnly(gemmAccelOp.getB());
-      std::tie(gemmOut, maybePadOut) = getSourceViewifPaddingOnly(gemmAccelOp.getC());
+      std::tie(gemmInA, maybePadA) =
+          getSourceViewifPaddingOnly(gemmAccelOp.getA());
+      std::tie(gemmInB, maybePadB) =
+          getSourceViewifPaddingOnly(gemmAccelOp.getB());
+      std::tie(gemmOut, maybePadOut) =
+          getSourceViewifPaddingOnly(gemmAccelOp.getC());
     } else if (GridwiseGemmOp gemmNonAccelOp =
                    dyn_cast<GridwiseGemmOp>(gemmOp)) {
-      std::tie(gemmInA, maybePadA) = getSourceViewifPaddingOnly(gemmNonAccelOp.getA());
-      std::tie(gemmInB, maybePadB) = getSourceViewifPaddingOnly(gemmNonAccelOp.getB());
-      std::tie(gemmOut, maybePadOut) = getSourceViewifPaddingOnly(gemmNonAccelOp.getC());
+      std::tie(gemmInA, maybePadA) =
+          getSourceViewifPaddingOnly(gemmNonAccelOp.getA());
+      std::tie(gemmInB, maybePadB) =
+          getSourceViewifPaddingOnly(gemmNonAccelOp.getB());
+      std::tie(gemmOut, maybePadOut) =
+          getSourceViewifPaddingOnly(gemmNonAccelOp.getC());
     }
     int64_t g = gemmInA.getType().getShape()[0];
     int64_t k = gemmInA.getType().getShape()[1];
@@ -577,9 +588,9 @@ rearrangeGemmParallelDimsForReduction(ReduceOp rOp,
       trGemmInA = rewriter.create<TransformOp>(rOp.getLoc(), trGemmInA,
                                                cast<TransformMapAttr>(trMap));
     }
-    if(maybePadA){
-      trGemmInA = rewriter.create<TransformOp>(rOp.getLoc(), trGemmInA,
-                                               cast<TransformMapAttr>(maybePadA));
+    if (maybePadA) {
+      trGemmInA = rewriter.create<TransformOp>(
+          rOp.getLoc(), trGemmInA, cast<TransformMapAttr>(maybePadA));
     }
     Value trGemmInB = gemmInB;
     rewriter.setInsertionPointAfterValue(gemmInB);
@@ -587,9 +598,9 @@ rearrangeGemmParallelDimsForReduction(ReduceOp rOp,
       trGemmInB = rewriter.create<TransformOp>(rOp.getLoc(), trGemmInB,
                                                cast<TransformMapAttr>(trMap));
     }
-    if(maybePadB){
-      trGemmInB = rewriter.create<TransformOp>(rOp.getLoc(), trGemmInB,
-                                               cast<TransformMapAttr>(maybePadB));
+    if (maybePadB) {
+      trGemmInB = rewriter.create<TransformOp>(
+          rOp.getLoc(), trGemmInB, cast<TransformMapAttr>(maybePadB));
     }
     ArrayAttr additionalOutputViews = generateShuffledGemmOutputViews(
         rewriter, g, m, mnPerBlock.value().MPerBlock, n,
@@ -605,9 +616,9 @@ rearrangeGemmParallelDimsForReduction(ReduceOp rOp,
       if (!firstUse)
         firstUse = trGemmOut;
     }
-    if(maybePadOut){
-      trGemmOut = rewriter.create<TransformOp>(rOp.getLoc(), trGemmOut,
-                                               cast<TransformMapAttr>(maybePadOut));
+    if (maybePadOut) {
+      trGemmOut = rewriter.create<TransformOp>(
+          rOp.getLoc(), trGemmOut, cast<TransformMapAttr>(maybePadOut));
     }
     if (GridwiseGemmAccelOp gemmAccelOp =
             dyn_cast<GridwiseGemmAccelOp>(gemmOp)) {

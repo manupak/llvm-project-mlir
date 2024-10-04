@@ -205,7 +205,9 @@ GemmRewritePattern::matchAndRewrite(GemmOp op, GemmOpAdaptor adaptor,
 
   a = padMatrix(a, rw, loc, "gemmK", extraPad.k, "gemmM", extraPad.m);
   b = padMatrix(b, rw, loc, "gemmK", extraPad.k, "gemmN", extraPad.n);
-  c = padMatrix(c, rw, loc, "gemmM", extraPad.m, "gemmN", extraPad.n);
+  auto accumulator = getAccumulator(a, b, c, rw, loc);
+  auto accumulatorPadded =
+      padMatrix(accumulator, rw, loc, "gemmM", extraPad.m, "gemmN", extraPad.n);
 
   if (failed(computeGridSize(rw, op, a, b))) {
     return op.emitError("failed to compute the grid size of `GemmOp`");
@@ -226,15 +228,15 @@ GemmRewritePattern::matchAndRewrite(GemmOp op, GemmOpAdaptor adaptor,
   if (!gridSize)
     return op.emitOpError("grid size must be set at lowering");
 
-  auto accumulator = getAccumulator(a, b, c, rw, loc);
   if (isAccel) {
     rw.create<GridwiseGemmAccelOp>(
-        loc, a, b, accumulator, op.getArchAttr(), numCUAttr,
+        loc, a, b, accumulatorPadded, op.getArchAttr(), numCUAttr,
         op.getFeaturesAttr(), op.getStoreMethodAttr(), blockSize, gridSize,
         cast<RockAccelTuningParamAttrInterface>(params));
   } else {
-    rw.create<GridwiseGemmOp>(loc, a, b, accumulator, op.getFeaturesAttr(),
-                              op.getStoreMethodAttr(), numCUAttr, gridSize,
+    rw.create<GridwiseGemmOp>(loc, a, b, accumulatorPadded,
+                              op.getFeaturesAttr(), op.getStoreMethodAttr(),
+                              numCUAttr, gridSize,
                               cast<GeneralGemmParamsAttr>(params));
   }
 
