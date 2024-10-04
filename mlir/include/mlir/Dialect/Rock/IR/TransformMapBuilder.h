@@ -149,6 +149,8 @@ public:
   // If you find you need one, please add it, bearing in mind
   // that your start dimension is already sliced so you need to pass the full
   // length
+  void slice(ArrayRef<StringRef> lowerNames, ArrayRef<StringRef> upperNames,
+             ArrayRef<int64_t> begins, ArrayRef<int64_t> ends, ArrayRef<int64_t> lowerSizes);
 
   // Drop `dim`, making it disappear from the underlying view.
   void ignore(StringRef dim);
@@ -255,9 +257,6 @@ public:
 
   void broadcast(ArrayRef<uint32_t> endDims, ArrayRef<int64_t> endSizes);
 
-  void slice(ArrayRef<StringRef> upperNames, ArrayRef<StringRef> lowerNames,
-             ArrayRef<int64_t> begins, ArrayRef<int64_t> ends);
-
   void embed(ArrayRef<StringRef> upperNames, ArrayRef<uint32_t> upperDims,
              ArrayRef<int64_t> upperSizes, StringRef lowerName,
              ArrayRef<int64_t> coefficients);
@@ -268,6 +267,8 @@ public:
   // dimensions
   void merge(StringRef upperName, uint32_t upperDim,
              ArrayRef<StringRef> lowerNames);
+  void slice(ArrayRef<StringRef> upperNames, ArrayRef<StringRef> lowerNames,
+             ArrayRef<int64_t> begins, ArrayRef<int64_t> ends);
 
 protected:
   void addTransform(TransformType type, ArrayRef<int64_t> params,

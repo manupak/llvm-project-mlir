@@ -1363,21 +1363,24 @@ mlir::rock::makeLinalgGenericWithIdentityAffMaps(PatternRewriter &b,
 
 TransformMapAttr mlir::rock::invertTransformMap(
     OpBuilder &b, mlir::rock::TransformMapAttr transformMap, Location loc) {
-  ArrayRef<int64_t> lowShape = transformMap.getLowerBounds();
-  llvm::IndexedMap<StringRef> lowNamesMap;
-  if (!lowShape.empty())
-    lowNamesMap.grow(lowShape.size() - 1); // grow takes largest index;
-  for (auto transform : transformMap.getOps()) {
-    for (const auto &[name, dim] :
-         llvm::zip(transform.getLowerNames(), transform.getLowerDims())) {
-      lowNamesMap[dim] = name;
+  SmallVector<int64_t> lowShape = llvm::to_vector(transformMap.getLowerBounds().asArrayRef());
+  SmallVector<StringRef> lowNames;
+  {
+      llvm::IndexedMap<StringRef> lowNamesMap;
+    if (!lowShape.empty())
+      lowNamesMap.grow(lowShape.size() - 1); // grow takes largest index;
+    for (auto transform : transformMap.getOps()) {
+      for (const auto &[name, dim] :
+          llvm::zip(transform.getLowerNames(), transform.getLowerDims())) {
+        lowNamesMap[dim] = name;
+      }
+    }
+    lowNames.reserve(lowNamesMap.size());
+    for (size_t i = 0, e = lowNamesMap.size(); i < e; ++i) {
+      lowNames.push_back(lowNamesMap[i]);
     }
   }
-  SmallVector<StringRef> lowNames;
-  lowNames.reserve(lowNamesMap.size());
-  for (size_t i = 0, e = lowNamesMap.size(); i < e; ++i) {
-    lowNames.push_back(lowNamesMap[i]);
-  }
+  ArrayRef<int64_t> upperShape = transformMap.getUpperBounds();
 
   rock::TopDownTMBuilder transform(b, lowNames, lowShape, loc);
   for (auto tattr : transformMap.getOps()) {
@@ -1387,7 +1390,34 @@ TransformMapAttr mlir::rock::invertTransformMap(
                             tattr.getLowerNames());
       break;
     case rock::TransformType::Pad:
+    {
+      SmallVector<int64_t> begins;
+      SmallVector<int64_t> ends;
+      SmallVector<int64_t> lowerSizes;
+      for(size_t i=0; i<tattr.getUpperNames().size(); i++){
+        int64_t upperDimSize = upperShape[tattr.getUpperDims()[i]];
+        lowerSizes.push_back(upperDimSize);
+        int64_t begin = tattr.getParams()[i*2];
+        int64_t end = upperDimSize - tattr.getParams()[i*2 + 1];
+        begins.push_back(begin);
+        ends.push_back(end);
+      }
+      transform.slice(tattr.getUpperNames(), tattr.getLowerNames(), begins, ends, lowerSizes);
+      break;
+    }
     case rock::TransformType::Slice:
+    {
+      SmallVector<int64_t> params;
+      for(size_t i=0; i<tattr.getUpperNames().size(); i++){
+        int64_t upperDimSize = upperShape[tattr.getUpperDims()[i]];
+        int64_t beginPad = tattr.getParams()[i*2];
+        int64_t endPad = upperDimSize - tattr.getParams()[i*2 + 1];
+        params.push_back(beginPad);
+        params.push_back(endPad);
+      }
+      transform.pad(tattr.getUpperNames(), params);
+      break;
+    }
     case rock::TransformType::Embed:
     case rock::TransformType::Broadcast: // Unsupported
       return rock::TransformMapAttr();
@@ -2497,6 +2527,12 @@ mlir::rock::getLowerSubDimensions(OpBuilder &b, ArrayAttr transformAttrs,
                 }
               }
             }
+          }
+          break;
+        }
+        case TransformType::Slice: {
+          for(auto[lowerDim, upperDim] : zip(trAttr.getLowerDims(),trAttr.getUpperDims())){
+            nextSubDimInfo[lowerDim] = currSubDimInfo.at(upperDim);
           }
           break;
         }

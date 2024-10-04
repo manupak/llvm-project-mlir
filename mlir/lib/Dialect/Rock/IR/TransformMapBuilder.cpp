@@ -768,6 +768,38 @@ void BottomUpTMBuilder::slice(ArrayRef<StringRef> upperNames,
                dims);
 }
 
+void TopDownTMBuilder::slice(ArrayRef<StringRef> lowerNames,
+                             ArrayRef<StringRef> upperNames,
+                             ArrayRef<int64_t> begins,
+                             ArrayRef<int64_t> ends,
+                             ArrayRef<int64_t> lowerSizes) {
+  assert(upperNames.size() == lowerNames.size() &&
+         "Need same number of input and output dimensions in slice");
+  assert(upperNames.size() == begins.size() &&
+         "Need beginning of slice for each dimension");
+  assert(upperNames.size() == ends.size() &&
+         "Need end of slice for each dimension");
+
+  uint32_t n = upperNames.size();
+  SmallVector<uint32_t, 4> dims;
+  dims.reserve(n);
+
+  SmallVector<int64_t, 8> params;
+  params.reserve(2 * n);
+
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t dim = startIndex(upperNames[i]);
+    dims.push_back(dim);
+    int64_t begin = begins[i];
+    int64_t end = ends[i];
+    defineDim(lowerNames[i], dim, lowerSizes[i]);
+    params.push_back(begin);
+    params.push_back(end);
+  }
+  addTransform(TransformType::Slice, params, lowerNames, dims, upperNames,
+               dims);
+}
+
 void BottomUpTMBuilder::embed(ArrayRef<StringRef> upperNames,
                               ArrayRef<uint32_t> upperDims,
                               ArrayRef<int64_t> upperSizes, StringRef lowerName,
