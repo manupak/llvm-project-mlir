@@ -431,6 +431,86 @@ Value mlir::rock::padMatrix(Value matrix, OpBuilder &b, Location loc,
   return b.create<TransformOp>(loc, matrix, padAttr);
 }
 
+Value mlir::rock::tileAndpadMatrix(Value matrix, OpBuilder &b, Location loc, StringRef firstDim,
+                                   std::optional<int64_t> firstDimTileLen, StringRef secondDim, std::optional<int64_t> secondDimTileLen){
+  ArrayRef<int64_t> shape = cast<MemRefType>(matrix.getType()).getShape();
+  int64_t firstDimLen = shape[1];
+  int64_t firstDimTileNonPaddedLen = 0;
+  if(firstDimTileLen.has_value()){
+    firstDimTileNonPaddedLen = math_util::largest_factor_less_than(firstDimLen, firstDimTileLen.value());
+  }
+  int64_t secondDimLen = shape[2];
+  int64_t secondDimTileNonPaddedLen = 0;
+  if(secondDimTileLen.has_value()){
+    secondDimTileNonPaddedLen = math_util::largest_factor_less_than(secondDimLen, secondDimTileLen.value());
+  }
+
+  BottomUpTMBuilder tiler(b, {"gemmG", firstDim, secondDim}, shape, loc);
+  TransformMapAttr tiled;
+  {
+    tiler.passThrough("gemmG");
+    unsigned dimInsertionPoint = 1;
+    if(firstDimTileLen.has_value()){
+      tiler.unmerge({"m_blocks", "m_per_block"}, {dimInsertionPoint, dimInsertionPoint + 1}, firstDim, {firstDimLen / firstDimTileNonPaddedLen, firstDimTileNonPaddedLen});
+      dimInsertionPoint += 2;
+    }
+    else{
+      tiler.passThrough({dimInsertionPoint++}, {1});
+    }
+    if(secondDimTileLen.has_value()){
+      llvm::errs() << "secondDimLen=" << secondDimLen << "\n";
+      llvm::errs() << "secondDimTileNonPaddedLen=" << secondDimTileNonPaddedLen << "\n";
+      tiler.unmerge({"n_blocks", "n_per_block"}, {dimInsertionPoint, dimInsertionPoint + 1}, secondDim, {secondDimLen / secondDimTileNonPaddedLen, secondDimTileNonPaddedLen});
+      dimInsertionPoint += 2;
+    }
+    else{
+      tiler.passThrough({dimInsertionPoint++}, {2});
+    }
+    tiled = tiler.get();
+  }
+  Value tiledVal = b.create<TransformOp>(loc, matrix, tiled);
+  auto padder = BottomUpTMBuilder::above(tiler, tiled);
+  TransformMapAttr padded;
+  {
+    padder.passThrough("gemmG");
+    padder.passThrough({1}, {1});
+    unsigned nDimStart = 2;
+    if(firstDimTileLen.has_value()){
+      nDimStart = 3;
+      padder.pad({"m_per_block"}, {0, firstDimTileLen.value() - firstDimTileNonPaddedLen});
+    }
+    if(secondDimTileLen.has_value()){
+      padder.passThrough({nDimStart}, {nDimStart});
+      padder.pad({"n_per_block"}, {0, secondDimTileLen.value() - secondDimTileNonPaddedLen});
+    }
+    else{
+      padder.passThrough({2}, {nDimStart});
+    }
+    padded = padder.get();
+  }
+  Value paddedVal = b.create<TransformOp>(loc, tiledVal, padded);
+  auto toGemmShape = BottomUpTMBuilder::above(padder, padded);
+  {
+    toGemmShape.passThrough("gemmG");
+    unsigned nDimStart;
+    if(firstDimTileLen.has_value()){
+      toGemmShape.merge(firstDim, 1, {"m_blocks", "m_per_block"});
+      nDimStart = 3;
+    }
+    else{
+      nDimStart = 2;
+      toGemmShape.passThrough({1}, {1});
+    }
+    if(secondDimTileLen.has_value()){
+      toGemmShape.merge(secondDim, 2, {"n_blocks", "n_per_block"});
+    }
+    else{
+      toGemmShape.passThrough({2}, {nDimStart});
+    }
+  }
+  return b.create<TransformOp>(loc, paddedVal, toGemmShape.get());
+}
+
 TopDownTMBuilder mlir::rock::swapThreadIdAndIteration(
     TopDownTMBuilder &toMatrixC, int64_t mBlocks, int64_t nBlocks,
     int64_t copyMPerThread, int64_t copyNPerThread, int64_t mPerBlock,

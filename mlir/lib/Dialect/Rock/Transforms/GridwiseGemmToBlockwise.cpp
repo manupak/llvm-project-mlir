@@ -2810,13 +2810,83 @@ struct GridwiseGemmAccelRewritePattern
   }
 };
 
+//===----------------------------------------------------------------------===//
+// TileAndPadOp lowering.
+//===----------------------------------------------------------------------===//
+
+struct TileAndPadOpRewritePattern
+    : public OpRewritePattern<TileAndPadOp> {
+  using OpRewritePattern<TileAndPadOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TileAndPadOp op,
+                                PatternRewriter &b) const override {
+    Location loc = op.getLoc();
+    ArrayRef<int64_t> shape = op.getInput().getType().getShape();
+    SmallVector<SmallString<8>> startNames = createDimNames(shape.size(), "d");
+    SmallVector<StringRef> startNameRefs = getStringRefsFor(startNames);
+
+    unsigned tilingDim = op.getDim().getZExtValue();
+    std::string dBlocksName = startNameRefs[tilingDim].str() + "_block";
+    std::string dPerBlockName = startNameRefs[tilingDim].str() + "_per_block";
+    int64_t prePadTileSize = math_util::largest_factor_less_than(shape[tilingDim], op.getTileSize().getSExtValue());
+
+    b.setInsertionPointAfter(op);
+    BottomUpTMBuilder tiler(b, startNameRefs, shape, loc);
+    TransformMapAttr tiled;
+    {
+      unsigned dimInsertionPoint=0;
+      for(unsigned dim=0; dim < shape.size(); dim++){
+        if(dim == tilingDim){
+          tiler.unmerge({dBlocksName, dPerBlockName}, {dimInsertionPoint, dimInsertionPoint + 1}, startNameRefs[dim], {shape[dim] / prePadTileSize, prePadTileSize});
+          dimInsertionPoint += 2;
+        }
+        else{
+          tiler.passThrough({dimInsertionPoint++}, dim);
+        }
+      }
+      tiled = tiler.get();
+    }
+    Value tiledVal = b.create<TransformOp>(loc, op.getInput(), tiled);
+    auto padder = BottomUpTMBuilder::above(tiler, tiled);
+    TransformMapAttr padded;
+    {
+      for(unsigned dim=0; dim < shape.size() + 1; dim++){
+        if(dim == tilingDim + 1){
+          padder.pad({dPerBlockName}, {0, op.getTileSize().getSExtValue() - prePadTileSize});
+        }
+        else{
+          padder.passThrough({dim}, dim);
+        }
+      }
+      padded = padder.get();
+    }
+    Value paddedVal = b.create<TransformOp>(loc, tiledVal, padded);
+    auto collapser = BottomUpTMBuilder::above(padder, padded);
+    TransformMapAttr collapsed;
+    {
+      unsigned dimInsertionPoint=0;
+      for(unsigned dim=0; dim < shape.size() + 1; dim++){
+        if(dim == tilingDim){
+          collapser.merge(startNameRefs[dim], dimInsertionPoint++, {dBlocksName, dPerBlockName});
+        }
+        else if(dim != tilingDim + 1){
+          collapser.passThrough({dimInsertionPoint++}, dim);
+        }
+      }
+      collapsed = collapser.get();
+    }
+    b.replaceOpWithNewOp<TransformOp>(op, paddedVal, collapsed);
+    return success();
+  }
+};
+
 } // end anonymous namespace
 
 void RockGridwiseGemmToBlockwisePass::runOnOperation() {
   MLIRContext *ctx = &getContext();
   ConversionTarget target(*ctx);
   target.addIllegalOp<rock::GridwiseGemmOp, rock::GridwiseGemmAccelOp,
-                      GridwiseAttentionAccelOp>();
+                      GridwiseAttentionAccelOp, rock::TileAndPadOp>();
   target.addLegalDialect<arith::ArithDialect, rock::RockDialect,
                          memref::MemRefDialect, affine::AffineDialect,
                          vector::VectorDialect, linalg::LinalgDialect,
@@ -2825,7 +2895,7 @@ void RockGridwiseGemmToBlockwisePass::runOnOperation() {
 
   RewritePatternSet patterns(ctx);
   patterns.add<GridwiseGemmRewritePattern, GridwiseGemmAccelRewritePattern,
-               GridwiseAttentionAccelRewritePattern>(ctx);
+               GridwiseAttentionAccelRewritePattern, TileAndPadOpRewritePattern>(ctx);
   if (failed(applyPartialConversion(getOperation(), target,
                                     std::move(patterns)))) {
     signalPassFailure();

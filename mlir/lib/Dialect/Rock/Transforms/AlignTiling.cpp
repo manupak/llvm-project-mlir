@@ -1166,8 +1166,10 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
   for (int64_t i = 0; i < upperRank - 2; i++) {
     removeIndicesSet.insert(i);
   }
+  llvm::errs() << "toBeReducedViews=" << toBeReducedViews << "\n";
   FailureOr<ArrayAttr> blockSubTileViews =
       removeUpperDims(rewriter, toBeReducedViews, removeIndicesSet);
+  llvm::errs() << "blockSubTileViews=" << blockSubTileViews.value() << "\n"; 
   // We only want to keep tid in the maps
   // which is the last two for block subtile tid
   removeIndicesSet.clear();
@@ -1178,6 +1180,7 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
   }
   FailureOr<ArrayAttr> blockSubTileTidSliceViews =
       removeUpperDims(rewriter, toBeReducedViews, removeIndicesSet);
+  llvm::errs() << "blockSubTileTidSliceViews=" << blockSubTileTidSliceViews.value() << "\n"; 
   // We only want to keep iter in the maps
   // which is the last one.
   removeIndicesSet.clear();
@@ -1186,18 +1189,19 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
   }
   FailureOr<ArrayAttr> threadSubTileViews =
       removeUpperDims(rewriter, toBeReducedViews, removeIndicesSet);
+  llvm::errs() << "threadSubTileViews=" << threadSubTileViews.value() << "\n"; 
 
   // Extract grid-only dims
   removeIndicesSet.clear();
   for (int64_t i = upperRank - 2; i < upperRank; i++) {
     removeIndicesSet.insert(i);
   }
-  FailureOr<ArrayAttr> gridOnlyDims =
-      removeUpperDims(rewriter, toBeReducedViews, removeIndicesSet);
+  // FailureOr<ArrayAttr> gridOnlyDims =
+  //     removeUpperDims(rewriter, toBeReducedViews, removeIndicesSet);
 
-  FailureOr<llvm::SmallDenseMap<int64_t, SmallVector<SubDimInfo>>>
-      lowerSubDims =
-          getLowerSubDimensions(rewriter, toBeReducedViews, {0, 1, 2});
+  // FailureOr<llvm::SmallDenseMap<int64_t, SmallVector<SubDimInfo>>>
+  //     lowerSubDims =
+  //         getLowerSubDimensions(rewriter, toBeReducedViews, {0, 1, 2});
 
   int64_t reductionAxis = reduceOp.getAxisAttr().getInt();
   TypedValue<ShapedType> redOut = reduceOp.getOut();
@@ -1212,8 +1216,7 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
   // Currently, we use blockwise_reductions when fusing with reductions
   // if and only if all sub-tile view creations are successful.
   if (succeeded(blockSubTileViews) && succeeded(threadSubTileViews) &&
-      succeeded(blockSubTileTidSliceViews) && succeeded(gridOnlyDims) &&
-      succeeded(lowerSubDims)) {
+      succeeded(blockSubTileTidSliceViews)) {
     ArrayRef<int64_t> blockLowerShape =
         getLowerShape(blockSubTileViews.value());
     ArrayRef<int64_t> blockSubTileTidSliceShape =
@@ -1278,256 +1281,265 @@ ReduceRewritePattern::matchAndRewrite(rock::ReduceOp reduceOp,
           rewriter, blockSubTileViews.value(), arrayTransformAttrs);
     }
 
-    // Recombine block dimensions
-    {
-      SmallVector<TransformMapAttr> transformAttrs;
-      ArrayRef<int64_t> lowerShapeGridOnly =
-          getLowerShape(gridOnlyDims.value());
-      size_t lowerGridOnlyRank = lowerShapeGridOnly.size();
-      for (auto [idx, attr] : llvm::enumerate(paddedReducedTrStack)) {
-        TransformMapAttr trMapAttr = cast<TransformMapAttr>(attr);
-        SmallVector<TransformAttr> trAttrs;
-        SmallVector<int64_t> gridUpperShape;
-        SmallVector<int64_t> gridLowerShape;
-        if (idx < gridOnlyDims.value().size()) {
-          TransformMapAttr gridOnlyAttr =
-              cast<TransformMapAttr>(gridOnlyDims.value()[idx]);
-          ArrayRef<TransformAttr> ops = gridOnlyAttr.getOps();
-          trAttrs.insert(trAttrs.end(), ops.begin(), ops.end());
-          gridUpperShape =
-              llvm::to_vector(gridOnlyAttr.getUpperBounds().asArrayRef());
-          gridLowerShape =
-              llvm::to_vector(gridOnlyAttr.getLowerBounds().asArrayRef());
-        } else {
-          SmallVector<SmallString<8>> names;
-          SmallVector<StringRef> nameRefs;
-          SmallVector<unsigned> dims;
-          for (unsigned i = 0; i < lowerGridOnlyRank; i++) {
-            SmallString<8> dimName(Twine("dim" + Twine(i)).str());
-            names.push_back(dimName);
-            nameRefs.push_back(names.back());
-            dims.push_back(i);
-          }
-          gridUpperShape = llvm::to_vector(lowerShapeGridOnly);
-          gridLowerShape = llvm::to_vector(lowerShapeGridOnly);
-          TransformAttr blockPt = TransformAttr::get(
-              rewriter.getContext(), TransformType::PassThrough, {}, nameRefs,
-              dims, nameRefs, dims);
-          trAttrs.push_back(blockPt);
-        }
-        for (TransformAttr trAttr : trMapAttr.getOps()) {
-          SmallVector<unsigned> upperDims;
-          llvm::transform(
-              trAttr.getUpperDims(), std::back_inserter(upperDims),
-              [&](unsigned idx) { return idx + gridUpperShape.size(); });
-          SmallVector<unsigned> lowerDims;
-          llvm::transform(
-              trAttr.getLowerDims(), std::back_inserter(lowerDims),
-              [&](unsigned idx) { return idx + gridLowerShape.size(); });
-          TransformAttr newTrAttr =
-              TransformAttr::get(rewriter.getContext(), trAttr.getType(),
-                                 trAttr.getParams(), trAttr.getUpperNames(),
-                                 upperDims, trAttr.getLowerNames(), lowerDims);
-          trAttrs.push_back(newTrAttr);
-        }
-        // set the bounds
-        SmallVector<int64_t> upperBounds = gridUpperShape;
-        ArrayRef<int64_t> origUpperBounds =
-            trMapAttr.getUpperBounds().asArrayRef();
-        upperBounds.insert(upperBounds.end(), origUpperBounds.begin(),
-                           origUpperBounds.end());
-        SmallVector<int64_t> lowerBounds = gridLowerShape;
-        ArrayRef<int64_t> origLowerBounds =
-            trMapAttr.getLowerBounds().asArrayRef();
-        lowerBounds.insert(lowerBounds.end(), origLowerBounds.begin(),
-                           origLowerBounds.end());
-        // create new trMapAttr
-        LLVM_DEBUG(llvm::dbgs() << "trAttrs = ";
-                   llvm::interleaveComma(trAttrs, llvm::dbgs());
-                   llvm::dbgs() << "\n"; llvm::dbgs() << "upperBounds = ";
-                   llvm::interleaveComma(upperBounds, llvm::dbgs());
-                   llvm::dbgs() << "\n"; llvm::dbgs() << "lowerBounds = ";
-                   llvm::interleaveComma(lowerBounds, llvm::dbgs());
-                   llvm::dbgs() << "\n");
-        TransformMapAttr newTrMap =
-            TransformMapAttr::get(trAttrs, upperBounds, lowerBounds);
-        transformAttrs.push_back(newTrMap);
-      }
-      ArrayRef<int64_t> currLowerShape =
-          cast<TransformMapAttr>(transformAttrs.back()).getLowerBounds();
-      if (currLowerShape.size() < lowerGridOnlyRank * 2) {
-        SmallVector<SmallString<8>> names;
-        SmallVector<StringRef> nameRefs;
-        for (size_t i = 0; i < currLowerShape.size(); i++) {
-          SmallString<8> dimName(Twine("d" + Twine(i)).str());
-          names.push_back(dimName);
-          nameRefs.push_back(names.back());
-        }
-        TopDownTMBuilder toAddMissingBlockDims(rewriter, nameRefs,
-                                               currLowerShape);
-        {
-          toAddMissingBlockDims.passThrough({0, 1, 2}, {0, 1, 2});
-          int64_t missingDimCount =
-              lowerGridOnlyRank * 2 - currLowerShape.size();
-          SmallVector<SmallString<8>> names;
-          SmallVector<StringRef> nameRefs;
-          unsigned dimInsertionPoint = 3;
-          for (int64_t md = 0; md < missingDimCount; md++) {
-            SmallString<8> dimName(Twine("cd" + Twine(md)).str());
-            names.push_back(dimName);
-            nameRefs.push_back(names.back());
-            toAddMissingBlockDims.constDim(nameRefs.back(), dimInsertionPoint++,
-                                           0, 1);
-          }
-          for (unsigned lowerDim = 3; lowerDim < currLowerShape.size();
-               lowerDim++) {
-            toAddMissingBlockDims.passThrough({dimInsertionPoint++},
-                                              {lowerDim});
-          }
-          TransformMapAttr addMissingBlockDims = toAddMissingBlockDims.get();
-          LLVM_DEBUG(llvm::dbgs() << "addMissingBlockDims = "
-                                  << addMissingBlockDims << "\n");
-          transformAttrs.push_back(addMissingBlockDims);
-        }
-      }
-      currLowerShape =
-          cast<TransformMapAttr>(transformAttrs.back()).getLowerBounds();
-      assert(currLowerShape.size() == lowerGridOnlyRank * 2);
+    //Create validity for partial reductions
+    auto privateMemoryAddressSpace = rewriter.getAttr<gpu::AddressSpaceAttr>(gpu::GPUDialect::getPrivateAddressSpace());
+    MemRefType validityType = MemRefType::get(broadcastReducedSrc.getType().getShape(), rewriter.getI1Type(), AffineMap{}, privateMemoryAddressSpace);
+    auto validity = rewriter.create<GpuAllocOp>(loc, validityType);
+    rewriter.create<ThreadwiseFillValidityOp>(loc, paddedReducedTrStack, threadwiseWriteOp.getExtraIndices().slice(3, 2), validity);
+    threadwiseWriteOp.getDynamicValidityMutable().assign(validity);
+    assert(false);
 
-      // The last two transforms are constructed bottom up as it is easier.
-      // where we joint them once we have grid and block tiles coordinates
-      // seperated.
-      ArrayRef<int64_t> toBeReducedShape = getLowerShape(toBeReducedViews);
-      SmallVector<SmallString<8>> reduceLowerShapeNames =
-          createDimNames(toBeReducedShape.size(), "d");
-      SmallVector<StringRef> reduceLowerShapeNameRefs =
-          getStringRefsFor(reduceLowerShapeNames);
-      BottomUpTMBuilder toMatrixView(rewriter, reduceLowerShapeNameRefs,
-                                     toBeReducedShape);
-      llvm::SmallDenseMap<int64_t, SmallVector<int64_t>> gridSubDims;
-      llvm::SmallDenseMap<int64_t, SmallVector<int64_t>> blockSubDims;
-      TransformMapAttr lastMerge;
-      {
-        llvm::SmallDenseMap<int64_t, SmallVector<SmallString<8>>> names;
-        llvm::SmallDenseMap<int64_t, SmallVector<StringRef>> nameRefs;
-        llvm::SmallDenseMap<int64_t, SmallVector<unsigned>> upperDims;
-        int64_t dimInsertionPoint = 0;
-        for (unsigned dim = 0; dim < toBeReducedShape.size(); dim++) {
-          // The lower subDims contain sub-dimensions where blocking
-          // indices -- namesly g_block, m_block and n_block -- maps to
-          // in the matrix coordinates. Here we split out matrix dims
-          // into sub-dims that are related to the said blocking dimensions.
-          SmallVector<SubDimInfo> subDims = lowerSubDims.value()[dim];
-          llvm::sort(subDims, [](const SubDimInfo &L, const SubDimInfo &R) {
-            return L.stride > R.stride;
-          });
-          SmallVector<int64_t> splitSizes;
-          int64_t currSize = toBeReducedShape[dim];
-          for (const SubDimInfo &subDim : subDims) {
-            assert(currSize % (subDim.size * subDim.stride) == 0);
-            int64_t newSize = currSize / (subDim.size * subDim.stride);
-            if (newSize > 1) {
-              blockSubDims[dim].push_back(dimInsertionPoint);
-              SmallString<8> dimName(Twine("block_dim" + Twine(dim) + "_" +
-                                           Twine(dimInsertionPoint))
-                                         .str());
-              names[dim].push_back(dimName);
-              nameRefs[dim].push_back(names[dim].back());
-              upperDims[dim].push_back(dimInsertionPoint++);
-              splitSizes.push_back(newSize);
-            }
-            gridSubDims[dim].push_back(dimInsertionPoint);
-            SmallString<8> dimName(
-                Twine("grid_dim" + Twine(dim) + "_" + Twine(dimInsertionPoint))
-                    .str());
-            names[dim].push_back(dimName);
-            nameRefs[dim].push_back(names[dim].back());
-            upperDims[dim].push_back(dimInsertionPoint++);
-            splitSizes.push_back(subDim.size);
-            currSize = subDim.stride;
-          }
-          if (currSize > 1 || splitSizes.empty()) {
-            blockSubDims[dim].push_back(dimInsertionPoint);
-            SmallString<8> dimName(
-                Twine("block_dim" + Twine(dim) + "_" + Twine(dimInsertionPoint))
-                    .str());
-            names[dim].push_back(dimName);
-            nameRefs[dim].push_back(names[dim].back());
-            upperDims[dim].push_back(dimInsertionPoint++);
-            splitSizes.push_back(currSize);
-          }
-          LLVM_DEBUG(llvm::dbgs() << "dim=" << dim << "\n");
-          LLVM_DEBUG(llvm::dbgs() << "\tsplits=";
-                     llvm::interleaveComma(splitSizes, llvm::dbgs());
-                     llvm::dbgs() << "\n");
-          toMatrixView.unmerge(nameRefs[dim], upperDims[dim],
-                               reduceLowerShapeNameRefs[dim], splitSizes);
-        }
-        lastMerge = toMatrixView.get();
-      }
-      LLVM_DEBUG(llvm::dbgs() << "lastMerge=" << lastMerge << "\n");
-      // The above view contains splitted sub-dims that are either associated
-      // with grid and non-grid dimensions. Then, we concat them into 6
-      // dimensions here: [concat_grid_dim0, concat_grid_dim1, concat_grid_dim2,
-      // concat_blk_dim0, concat_blk_dim1, concat_blk_dim2]
-      BottomUpTMBuilder toGridBlockSeperation =
-          BottomUpTMBuilder::above(toMatrixView, lastMerge);
-      TransformMapAttr gridblockSeperation;
-      {
-        SmallVector<StringRef, 4> lowerNameRefs;
-        toGridBlockSeperation.getStartNames(lowerNameRefs);
-        SmallVector<std::string> upperGridNames;
-        for (unsigned dim = 0; dim < toBeReducedShape.size(); dim++) {
-          upperGridNames.push_back(Twine("grid_dim" + Twine(dim)).str());
-          if (gridSubDims.contains(dim)) {
-            SmallVector<StringRef, 4> upperGridSubDimNames;
-            for (int64_t upperGridSubDim : gridSubDims[dim]) {
-              upperGridSubDimNames.push_back(lowerNameRefs[upperGridSubDim]);
-            }
-            toGridBlockSeperation.merge(upperGridNames.back(), dim,
-                                        upperGridSubDimNames);
-          } else {
-            toGridBlockSeperation.addDim(upperGridNames.back(), dim, 1);
-          }
-        }
-        SmallVector<std::string> upperBlockNames;
-        for (unsigned dim = 0; dim < toBeReducedShape.size(); dim++) {
-          upperBlockNames.push_back(Twine("block_dim" + Twine(dim)).str());
-          if (blockSubDims.contains(dim)) {
-            SmallVector<StringRef, 4> upperBlockSubDimNames;
-            for (int64_t upperBlockSubDim : blockSubDims[dim]) {
-              upperBlockSubDimNames.push_back(lowerNameRefs[upperBlockSubDim]);
-            }
-            toGridBlockSeperation.merge(upperBlockNames.back(),
-                                        dim + toBeReducedShape.size(),
-                                        upperBlockSubDimNames);
-          } else {
-            toGridBlockSeperation.addDim(upperBlockNames.back(),
-                                         dim + toBeReducedShape.size(), 1);
-          }
-        }
-        gridblockSeperation = toGridBlockSeperation.get();
-      }
-      LLVM_DEBUG(llvm::dbgs()
-                 << "gridblockSeperation=" << gridblockSeperation << "\n");
-      // Now we join them to finish the recombination.
-      transformAttrs.push_back(gridblockSeperation);
-      transformAttrs.push_back(lastMerge);
-      reduceInShape =
-          cast<TransformMapAttr>(transformAttrs.back()).getLowerBounds();
-      BottomUpTMBuilder dropReductionDim(rewriter, reduceOutShape, loc);
-      for (uint32_t i = 0; i < reduceOutShape.size(); ++i) {
-        if (i == reductionAxis) {
-          dropReductionDim.broadcast({i}, {reduceInShape[i]});
-        } else {
-          dropReductionDim.passThrough({i}, {i});
-        }
-      }
-      transformAttrs.push_back(dropReductionDim.get());
-      views.clear();
-      views.insert(views.begin(), transformAttrs.begin(), transformAttrs.end());
-    }
-    threadwiseWriteOp.setExtraViewsAttr(rewriter.getArrayAttr({}));
+    // // Recombine block dimensions
+    // {
+    //   SmallVector<TransformMapAttr> transformAttrs;
+    //   ArrayRef<int64_t> lowerShapeGridOnly =
+    //       getLowerShape(gridOnlyDims.value());
+    //   size_t lowerGridOnlyRank = lowerShapeGridOnly.size();
+    //   for (auto [idx, attr] : llvm::enumerate(paddedReducedTrStack)) {
+    //     TransformMapAttr trMapAttr = cast<TransformMapAttr>(attr);
+    //     SmallVector<TransformAttr> trAttrs;
+    //     SmallVector<int64_t> gridUpperShape;
+    //     SmallVector<int64_t> gridLowerShape;
+    //     if (idx < gridOnlyDims.value().size()) {
+    //       TransformMapAttr gridOnlyAttr =
+    //           cast<TransformMapAttr>(gridOnlyDims.value()[idx]);
+    //       ArrayRef<TransformAttr> ops = gridOnlyAttr.getOps();
+    //       trAttrs.insert(trAttrs.end(), ops.begin(), ops.end());
+    //       gridUpperShape =
+    //           llvm::to_vector(gridOnlyAttr.getUpperBounds().asArrayRef());
+    //       gridLowerShape =
+    //           llvm::to_vector(gridOnlyAttr.getLowerBounds().asArrayRef());
+    //     } else {
+    //       SmallVector<SmallString<8>> names;
+    //       SmallVector<StringRef> nameRefs;
+    //       SmallVector<unsigned> dims;
+    //       for (unsigned i = 0; i < lowerGridOnlyRank; i++) {
+    //         SmallString<8> dimName(Twine("dim" + Twine(i)).str());
+    //         names.push_back(dimName);
+    //         nameRefs.push_back(names.back());
+    //         dims.push_back(i);
+    //       }
+    //       gridUpperShape = llvm::to_vector(lowerShapeGridOnly);
+    //       gridLowerShape = llvm::to_vector(lowerShapeGridOnly);
+    //       TransformAttr blockPt = TransformAttr::get(
+    //           rewriter.getContext(), TransformType::PassThrough, {}, nameRefs,
+    //           dims, nameRefs, dims);
+    //       trAttrs.push_back(blockPt);
+    //     }
+    //     for (TransformAttr trAttr : trMapAttr.getOps()) {
+    //       SmallVector<unsigned> upperDims;
+    //       llvm::transform(
+    //           trAttr.getUpperDims(), std::back_inserter(upperDims),
+    //           [&](unsigned idx) { return idx + gridUpperShape.size(); });
+    //       SmallVector<unsigned> lowerDims;
+    //       llvm::transform(
+    //           trAttr.getLowerDims(), std::back_inserter(lowerDims),
+    //           [&](unsigned idx) { return idx + gridLowerShape.size(); });
+    //       TransformAttr newTrAttr =
+    //           TransformAttr::get(rewriter.getContext(), trAttr.getType(),
+    //                              trAttr.getParams(), trAttr.getUpperNames(),
+    //                              upperDims, trAttr.getLowerNames(), lowerDims);
+    //       trAttrs.push_back(newTrAttr);
+    //     }
+    //     // set the bounds
+    //     SmallVector<int64_t> upperBounds = gridUpperShape;
+    //     ArrayRef<int64_t> origUpperBounds =
+    //         trMapAttr.getUpperBounds().asArrayRef();
+    //     upperBounds.insert(upperBounds.end(), origUpperBounds.begin(),
+    //                        origUpperBounds.end());
+    //     SmallVector<int64_t> lowerBounds = gridLowerShape;
+    //     ArrayRef<int64_t> origLowerBounds =
+    //         trMapAttr.getLowerBounds().asArrayRef();
+    //     lowerBounds.insert(lowerBounds.end(), origLowerBounds.begin(),
+    //                        origLowerBounds.end());
+    //     // create new trMapAttr
+    //     LLVM_DEBUG(llvm::dbgs() << "trAttrs = ";
+    //                llvm::interleaveComma(trAttrs, llvm::dbgs());
+    //                llvm::dbgs() << "\n"; llvm::dbgs() << "upperBounds = ";
+    //                llvm::interleaveComma(upperBounds, llvm::dbgs());
+    //                llvm::dbgs() << "\n"; llvm::dbgs() << "lowerBounds = ";
+    //                llvm::interleaveComma(lowerBounds, llvm::dbgs());
+    //                llvm::dbgs() << "\n");
+    //     TransformMapAttr newTrMap =
+    //         TransformMapAttr::get(trAttrs, upperBounds, lowerBounds);
+    //     transformAttrs.push_back(newTrMap);
+    //   }
+    //   ArrayRef<int64_t> currLowerShape =
+    //       cast<TransformMapAttr>(transformAttrs.back()).getLowerBounds();
+    //   if (currLowerShape.size() < lowerGridOnlyRank * 2) {
+    //     SmallVector<SmallString<8>> names;
+    //     SmallVector<StringRef> nameRefs;
+    //     for (size_t i = 0; i < currLowerShape.size(); i++) {
+    //       SmallString<8> dimName(Twine("d" + Twine(i)).str());
+    //       names.push_back(dimName);
+    //       nameRefs.push_back(names.back());
+    //     }
+    //     TopDownTMBuilder toAddMissingBlockDims(rewriter, nameRefs,
+    //                                            currLowerShape);
+    //     {
+    //       toAddMissingBlockDims.passThrough({0, 1, 2}, {0, 1, 2});
+    //       int64_t missingDimCount =
+    //           lowerGridOnlyRank * 2 - currLowerShape.size();
+    //       SmallVector<SmallString<8>> names;
+    //       SmallVector<StringRef> nameRefs;
+    //       unsigned dimInsertionPoint = 3;
+    //       for (int64_t md = 0; md < missingDimCount; md++) {
+    //         SmallString<8> dimName(Twine("cd" + Twine(md)).str());
+    //         names.push_back(dimName);
+    //         nameRefs.push_back(names.back());
+    //         toAddMissingBlockDims.constDim(nameRefs.back(), dimInsertionPoint++,
+    //                                        0, 1);
+    //       }
+    //       for (unsigned lowerDim = 3; lowerDim < currLowerShape.size();
+    //            lowerDim++) {
+    //         toAddMissingBlockDims.passThrough({dimInsertionPoint++},
+    //                                           {lowerDim});
+    //       }
+    //       TransformMapAttr addMissingBlockDims = toAddMissingBlockDims.get();
+    //       LLVM_DEBUG(llvm::dbgs() << "addMissingBlockDims = "
+    //                               << addMissingBlockDims << "\n");
+    //       transformAttrs.push_back(addMissingBlockDims);
+    //     }
+    //   }
+    //   currLowerShape =
+    //       cast<TransformMapAttr>(transformAttrs.back()).getLowerBounds();
+    //   assert(currLowerShape.size() == lowerGridOnlyRank * 2);
+
+    //   // The last two transforms are constructed bottom up as it is easier.
+    //   // where we joint them once we have grid and block tiles coordinates
+    //   // seperated.
+    //   ArrayRef<int64_t> toBeReducedShape = getLowerShape(toBeReducedViews);
+    //   SmallVector<SmallString<8>> reduceLowerShapeNames =
+    //       createDimNames(toBeReducedShape.size(), "d");
+    //   SmallVector<StringRef> reduceLowerShapeNameRefs =
+    //       getStringRefsFor(reduceLowerShapeNames);
+    //   BottomUpTMBuilder toMatrixView(rewriter, reduceLowerShapeNameRefs,
+    //                                  toBeReducedShape);
+    //   llvm::SmallDenseMap<int64_t, SmallVector<int64_t>> gridSubDims;
+    //   llvm::SmallDenseMap<int64_t, SmallVector<int64_t>> blockSubDims;
+    //   TransformMapAttr lastMerge;
+    //   {
+    //     llvm::SmallDenseMap<int64_t, SmallVector<SmallString<8>>> names;
+    //     llvm::SmallDenseMap<int64_t, SmallVector<StringRef>> nameRefs;
+    //     llvm::SmallDenseMap<int64_t, SmallVector<unsigned>> upperDims;
+    //     int64_t dimInsertionPoint = 0;
+    //     for (unsigned dim = 0; dim < toBeReducedShape.size(); dim++) {
+    //       // The lower subDims contain sub-dimensions where blocking
+    //       // indices -- namesly g_block, m_block and n_block -- maps to
+    //       // in the matrix coordinates. Here we split out matrix dims
+    //       // into sub-dims that are related to the said blocking dimensions.
+    //       SmallVector<SubDimInfo> subDims = lowerSubDims.value()[dim];
+    //       llvm::sort(subDims, [](const SubDimInfo &L, const SubDimInfo &R) {
+    //         return L.stride > R.stride;
+    //       });
+    //       SmallVector<int64_t> splitSizes;
+    //       int64_t currSize = toBeReducedShape[dim];
+    //       for (const SubDimInfo &subDim : subDims) {
+    //         assert(currSize % (subDim.size * subDim.stride) == 0);
+    //         int64_t newSize = currSize / (subDim.size * subDim.stride);
+    //         if (newSize > 1) {
+    //           blockSubDims[dim].push_back(dimInsertionPoint);
+    //           SmallString<8> dimName(Twine("block_dim" + Twine(dim) + "_" +
+    //                                        Twine(dimInsertionPoint))
+    //                                      .str());
+    //           names[dim].push_back(dimName);
+    //           nameRefs[dim].push_back(names[dim].back());
+    //           upperDims[dim].push_back(dimInsertionPoint++);
+    //           splitSizes.push_back(newSize);
+    //         }
+    //         gridSubDims[dim].push_back(dimInsertionPoint);
+    //         SmallString<8> dimName(
+    //             Twine("grid_dim" + Twine(dim) + "_" + Twine(dimInsertionPoint))
+    //                 .str());
+    //         names[dim].push_back(dimName);
+    //         nameRefs[dim].push_back(names[dim].back());
+    //         upperDims[dim].push_back(dimInsertionPoint++);
+    //         splitSizes.push_back(subDim.size);
+    //         currSize = subDim.stride;
+    //       }
+    //       if (currSize > 1 || splitSizes.empty()) {
+    //         blockSubDims[dim].push_back(dimInsertionPoint);
+    //         SmallString<8> dimName(
+    //             Twine("block_dim" + Twine(dim) + "_" + Twine(dimInsertionPoint))
+    //                 .str());
+    //         names[dim].push_back(dimName);
+    //         nameRefs[dim].push_back(names[dim].back());
+    //         upperDims[dim].push_back(dimInsertionPoint++);
+    //         splitSizes.push_back(currSize);
+    //       }
+    //       LLVM_DEBUG(llvm::dbgs() << "dim=" << dim << "\n");
+    //       LLVM_DEBUG(llvm::dbgs() << "\tsplits=";
+    //                  llvm::interleaveComma(splitSizes, llvm::dbgs());
+    //                  llvm::dbgs() << "\n");
+    //       toMatrixView.unmerge(nameRefs[dim], upperDims[dim],
+    //                            reduceLowerShapeNameRefs[dim], splitSizes);
+    //     }
+    //     lastMerge = toMatrixView.get();
+    //   }
+    //   LLVM_DEBUG(llvm::dbgs() << "lastMerge=" << lastMerge << "\n");
+    //   // The above view contains splitted sub-dims that are either associated
+    //   // with grid and non-grid dimensions. Then, we concat them into 6
+    //   // dimensions here: [concat_grid_dim0, concat_grid_dim1, concat_grid_dim2,
+    //   // concat_blk_dim0, concat_blk_dim1, concat_blk_dim2]
+    //   BottomUpTMBuilder toGridBlockSeperation =
+    //       BottomUpTMBuilder::above(toMatrixView, lastMerge);
+    //   TransformMapAttr gridblockSeperation;
+    //   {
+    //     SmallVector<StringRef, 4> lowerNameRefs;
+    //     toGridBlockSeperation.getStartNames(lowerNameRefs);
+    //     SmallVector<std::string> upperGridNames;
+    //     for (unsigned dim = 0; dim < toBeReducedShape.size(); dim++) {
+    //       upperGridNames.push_back(Twine("grid_dim" + Twine(dim)).str());
+    //       if (gridSubDims.contains(dim)) {
+    //         SmallVector<StringRef, 4> upperGridSubDimNames;
+    //         for (int64_t upperGridSubDim : gridSubDims[dim]) {
+    //           upperGridSubDimNames.push_back(lowerNameRefs[upperGridSubDim]);
+    //         }
+    //         toGridBlockSeperation.merge(upperGridNames.back(), dim,
+    //                                     upperGridSubDimNames);
+    //       } else {
+    //         toGridBlockSeperation.addDim(upperGridNames.back(), dim, 1);
+    //       }
+    //     }
+    //     SmallVector<std::string> upperBlockNames;
+    //     for (unsigned dim = 0; dim < toBeReducedShape.size(); dim++) {
+    //       upperBlockNames.push_back(Twine("block_dim" + Twine(dim)).str());
+    //       if (blockSubDims.contains(dim)) {
+    //         SmallVector<StringRef, 4> upperBlockSubDimNames;
+    //         for (int64_t upperBlockSubDim : blockSubDims[dim]) {
+    //           upperBlockSubDimNames.push_back(lowerNameRefs[upperBlockSubDim]);
+    //         }
+    //         toGridBlockSeperation.merge(upperBlockNames.back(),
+    //                                     dim + toBeReducedShape.size(),
+    //                                     upperBlockSubDimNames);
+    //       } else {
+    //         toGridBlockSeperation.addDim(upperBlockNames.back(),
+    //                                      dim + toBeReducedShape.size(), 1);
+    //       }
+    //     }
+    //     gridblockSeperation = toGridBlockSeperation.get();
+    //   }
+    //   LLVM_DEBUG(llvm::dbgs()
+    //              << "gridblockSeperation=" << gridblockSeperation << "\n");
+    //   // Now we join them to finish the recombination.
+    //   transformAttrs.push_back(gridblockSeperation);
+    //   transformAttrs.push_back(lastMerge);
+    //   reduceInShape =
+    //       cast<TransformMapAttr>(transformAttrs.back()).getLowerBounds();
+    //   BottomUpTMBuilder dropReductionDim(rewriter, reduceOutShape, loc);
+    //   for (uint32_t i = 0; i < reduceOutShape.size(); ++i) {
+    //     if (i == reductionAxis) {
+    //       dropReductionDim.broadcast({i}, {reduceInShape[i]});
+    //     } else {
+    //       dropReductionDim.passThrough({i}, {i});
+    //     }
+    //   }
+    //   transformAttrs.push_back(dropReductionDim.get());
+    //   views.clear();
+    //   views.insert(views.begin(), transformAttrs.begin(), transformAttrs.end());
+    // }
+
+    // threadwiseWriteOp.setExtraViewsAttr(rewriter.getArrayAttr({}));
     threadwiseWriteOp.getSourceMutable().assign(broadcastReducedSrc);
   } else {
     BottomUpTMBuilder dropReductionDim(rewriter, reduceOutShape, loc);

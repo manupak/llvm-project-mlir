@@ -89,6 +89,14 @@ struct ThreadwiseReadIntoRewritePattern
                                 ConversionPatternRewriter &b) const final;
 };
 
+struct ThreadwiseFillValidityRewritePattern
+    : public OpConversionPattern<ThreadwiseFillValidityOp> {
+  using OpConversionPattern<ThreadwiseFillValidityOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(ThreadwiseFillValidityOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &b) const final;
+};
+
 //===----------------------------------------------------------------------===//
 // ThreadwiseGemm lowering.
 //===----------------------------------------------------------------------===//
@@ -745,7 +753,12 @@ LogicalResult ThreadwiseWriteAllRewritePattern::matchAndRewrite(
     VectorizationResult vectorRes =
         getMaxVectorization(destView, extraIdxCount);
     vectorLen = vectorRes.max;
+    // Force the dynamic validity case down to a vectorization of 1
+    if (!adaptor.getDynamicValidity()) {
+      vectorLen = 1;
+    }
   }
+
   LLVM_DEBUG(llvm::dbgs() << "Max vectorization for write_all = " << vectorLen
                           << "\n");
 
@@ -781,12 +794,22 @@ LogicalResult ThreadwiseWriteAllRewritePattern::matchAndRewrite(
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(outLoop.getBody());
+    Value valid = outLoop.getValidity(/*domain=*/1);
+    Value destIndex = outLoop.getLowerCoords(/*domain=*/1)[extraIdxCount];
+    Value dynamicValidity = adaptor.getDynamicValidity();
+    if(dynamicValidity){
+      Value validityHere = b.create<vector::ExtractOp>(
+      loc, b.getI1Type(), dynamicValidity, destIndex,
+      ArrayRef<int64_t>{ShapedType::kDynamic});
+      valid = b.create<arith::AndIOp>(loc, b.getI1Type(), valid, validityHere);
+    }
+
     if (dstAddrSpace == gpu::AddressSpace::Global) {
       b.create<GlobalStoreOp>(loc, source, buffer, b.getIndexAttr(vectorLen),
                               op.getFeaturesAttr(), op.getStoreMethodAttr(),
                               outLoop.getLowerCoords(
                                   /*domain=*/0)[extraIdxCount],
-                              outLoop.getValidity(/*domain=*/1),
+                              valid,
                               outLoop.getLowerCoords(/*domain=*/1),
                               needs64BitIdx ? b.getUnitAttr() : nullptr,
                               /*canStoreOffEnd=*/nullptr,
@@ -796,7 +819,6 @@ LogicalResult ThreadwiseWriteAllRewritePattern::matchAndRewrite(
         return b.notifyMatchFailure(
             loc, "non-global address spaces must have 32-bit pointers");
       Type loadType = vectorTypeOrSelf(elementType, vectorLen);
-      TypedValue<IntegerType> valid = outLoop.getValidity(/*domain=*/0);
       scf::IfOp ifb = b.create<scf::IfOp>(loc, valid, /*withElseRegion=*/false);
       {
         OpBuilder thenb = ifb.getThenBodyBuilder();
@@ -818,13 +840,47 @@ LogicalResult ThreadwiseWriteAllRewritePattern::matchAndRewrite(
   return success();
 }
 
+LogicalResult ThreadwiseFillValidityRewritePattern::matchAndRewrite(
+    ThreadwiseFillValidityOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &b) const {
+
+  Location loc = op.getLoc();
+  TypedValue<MemRefType> dest = op.getDest();
+  ArrayRef<int64_t> destShape = dest.getType().getShape();
+  int64_t iterLen = destShape[0];
+
+  // Constant / consistent arguments
+  Value zero = b.createOrFold<arith::ConstantIndexOp>(loc, 0);
+
+  SmallVector<Value, 3> upperCoords =
+      llvm::to_vector<3>(adaptor.getExtraIndices());
+  upperCoords.push_back(zero);
+  SmallVector<int64_t, 3> bounds(upperCoords.size() - 1, 1);
+  bounds.push_back(iterLen);
+  SmallVector<int64_t, 3> strides(upperCoords.size() - 1, 1);
+  strides.push_back(1);
+  ArrayAttr transforms = op.getViews();
+
+  auto outLoop = b.create<TransformingForOp>(
+    loc, ArrayRef<ValueRange>{upperCoords, upperCoords},
+    ArrayRef<Attribute>{transforms, b.getArrayAttr({})}, bounds, strides,
+    true, true);
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(outLoop.getBody());
+    Value valid = outLoop.getValidity(/*domain=*/0);
+    b.create<memref::StoreOp>(loc, valid, dest, outLoop.getLowerCoords(/*domain=*/1).back());
+  }
+  return success();
+}
+
 void RockThreadwiseGemmLoweringPass::runOnOperation() {
   func::FuncOp op = getOperation();
   MLIRContext *ctx = &getContext();
   {
     ConversionTarget writeAllTarget(*ctx);
     writeAllTarget.addIllegalOp<ThreadwiseReadIntoOp, ThreadwiseWriteAllOp,
-                                ThreadwiseCopyOp>();
+                                ThreadwiseCopyOp, ThreadwiseFillValidityOp>();
     writeAllTarget.addLegalDialect<
         arith::ArithDialect, rock::RockDialect, memref::MemRefDialect,
         scf::SCFDialect, vector::VectorDialect, affine::AffineDialect>();
@@ -832,7 +888,7 @@ void RockThreadwiseGemmLoweringPass::runOnOperation() {
     RewritePatternSet writeAllPatterns(ctx);
     writeAllPatterns
         .add<ThreadwiseReadIntoRewritePattern, ThreadwiseWriteAllRewritePattern,
-             ThreadwiseCopyRewritePattern>(ctx);
+             ThreadwiseCopyRewritePattern, ThreadwiseFillValidityRewritePattern>(ctx);
     if (failed(applyPartialConversion(getOperation(), writeAllTarget,
                                       std::move(writeAllPatterns))))
       signalPassFailure();

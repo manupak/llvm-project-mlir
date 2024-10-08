@@ -136,6 +136,11 @@ Type vectorTypeOrSelf(Type elementType, int64_t len);
 Value padMatrix(Value matrix, OpBuilder &b, Location loc, StringRef firstDim,
                 int64_t firstDimPad, StringRef secondDim, int64_t secondDimPad);
 
+/// Apply padding to a matrix such that it is first tiled uniformly then padded
+/// upto the specificied tile lengths.
+Value tileAndpadMatrix(Value matrix, OpBuilder &b, Location loc, StringRef firstDim,
+                       std::optional<int64_t> firstDimTileLen, StringRef secondDim, std::optional<int64_t> secondDimTileLen);
+
 /// Normalize the argument into the form requested.
 /// If a group dimension is not present, add one.
 /// If doTranspose is true, meaning the user's transpose requests don't match

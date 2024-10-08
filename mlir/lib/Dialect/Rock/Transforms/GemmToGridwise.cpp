@@ -203,11 +203,26 @@ GemmRewritePattern::matchAndRewrite(GemmOp op, GemmOpAdaptor adaptor,
   GemmSize extraPad =
       requiredPadding(params, size).value_or(GemmSize{0, 0, 0, 0});
 
-  a = padMatrix(a, rw, loc, "gemmK", extraPad.k, "gemmM", extraPad.m);
-  b = padMatrix(b, rw, loc, "gemmK", extraPad.k, "gemmN", extraPad.n);
+  int64_t mPerBlock, nPerBlock;
+  if (auto generalParams = dyn_cast<GeneralGemmParamsAttr>(params)) {
+    mPerBlock = generalParams.getMPerBlock();
+    nPerBlock = generalParams.getNPerBlock();
+  } else if (auto accelParams =
+                 dyn_cast<RockAccelTuningParamAttrInterface>(params)) {
+    nPerBlock = accelParams.getNPerBlock();
+    mPerBlock = accelParams.getMPerBlock();
+  }
+  else{
+    llvm_unreachable("The tuning paramaters are general or xdlops");
+  }
+
+  a = padMatrix(a, rw, loc, "gemmK", extraPad.k, "gemmM", 0);
+  a = rw.create<TileAndPadOp>(loc, a, 2, mPerBlock);
+  b = padMatrix(b, rw, loc, "gemmK", extraPad.k, "gemmN", 0);
+  b = rw.create<TileAndPadOp>(loc, b, 2, nPerBlock);
   auto accumulator = getAccumulator(a, b, c, rw, loc);
-  auto accumulatorPadded =
-      padMatrix(accumulator, rw, loc, "gemmM", extraPad.m, "gemmN", extraPad.n);
+  auto accumulatorPadded = rw.create<TileAndPadOp>(loc, accumulator, 1, mPerBlock);
+  accumulatorPadded = rw.create<TileAndPadOp>(loc, accumulatorPadded, 2, nPerBlock);
 
   if (failed(computeGridSize(rw, op, a, b))) {
     return op.emitError("failed to compute the grid size of `GemmOp`");
@@ -569,7 +584,7 @@ void RockGemmToGridwisePass::runOnOperation() {
   ConversionTarget target(*ctx);
 
   target.addIllegalOp<rock::GemmOp, rock::AttentionOp>();
-  target.addLegalOp<rock::TransformOp, rock::GridwiseGemmOp,
+  target.addLegalOp<rock::TransformOp, rock::GridwiseGemmOp, rock::TileAndPadOp,
                     rock::GridwiseGemmAccelOp, rock::GridwiseAttentionAccelOp,
                     memref::AllocOp, linalg::GenericOp, arith::TruncIOp,
                     arith::ExtFOp, arith::ExtSIOp, arith::TruncFOp>();

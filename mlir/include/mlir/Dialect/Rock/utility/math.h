@@ -45,6 +45,18 @@ template <class X, class Y> auto integer_least_multiple(X x, Y y) {
   return y * integer_divide_ceil(x, y);
 }
 
+template <class T> T largest_factor_less_than(T x, T y) {
+  for (T f = 1; f <= sqrt(x); f++){
+    if (x % f == 0){
+      T otherFactor = x / f;
+      if(otherFactor <= y){
+        return otherFactor;
+      }
+    }
+  }
+  return 1;
+}
+
 /// Returns a % b except that when a % b, returns b
 template <class X> constexpr X mod_1_to_n(X a, X b) {
   return (a % b == 0) ? b : a % b;

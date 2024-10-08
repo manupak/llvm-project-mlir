@@ -322,7 +322,7 @@ def Rock_TransformOp :
     Results<(outs AnyShaped:$output)> {
   let summary = "Tensor transformation";
   let description = [{
-    Create a viee `output` of the tensor `input` with the same element type
+    Create a view `output` of the tensor `input` with the same element type
     such that, when the coordinates used to index into `output` are passed through
     the coordinate transformations `transforms` from left to right,
     they become coordinates into the `input` tensor.
@@ -427,6 +427,30 @@ def Rock_GridwiseGemmAccelOp :
     `(` operands `)` `storeMethod` `(` $storeMethod `)` `features` `=` $features attr-dict `:` type(operands)
   }];
   let hasVerifier = 1;
+}
+
+// gridwise_tile_and_pad
+def Rock_TileAndPadOp :
+    Rock_Op<"tile_and_pad", [Pure, ViewLikeOpInterface]>,
+    Arguments<(ins AnyMemRef:$input, 
+                   IndexAttr:$dim,
+                   IndexAttr:$tileSize)>,
+    Results<(outs AnyMemRef:$output)> {
+    let summary = "Tile the dim and pad upto tile size";
+    let description = [{
+      This operation will tile a given dimension with the largest factor
+      that is less than the tile size and pad upto the tile size. Then, it
+      will collapse the tiling dimension.
+    }];
+    let builders = [
+      OpBuilder<(ins "Value":$input, "int64_t":$dim, "int64_t":$tileSize)>
+    ];
+    let extraClassDeclaration = [{
+      Value getViewSource() { return getInput(); }
+    }];
+    let assemblyFormat = [{
+      $input `to` $tileSize `at` $dim attr-dict `:` type($input) `to` type($output)
+    }];
 }
 
 // gridwise_attention_accel
@@ -1093,15 +1117,33 @@ def Rock_ThreadwiseReadIntoOp :
   let hasVerifier = 1;
 }
 
+// threadwise_fill_validiy
+
+def Rock_ThreadwiseFillValidityOp :
+  Rock_Op<"threadwise_fill_validity", [DeclareOpInterfaceMethods<RockWriterOpInterface>]>,
+  Arguments<(ins TransformMapArrayAttr:$views,
+                 Variadic<Index>:$extraIndices,
+                 Arg<MemRefOf<[I1]>, "validity", [MemWrite]>: $dest
+            )>{
+  let summary = "This operation will fill the validity based on views and extraIndices";
+  let assemblyFormat = [{
+    attr-dict `valid` `(` $views (`[` $extraIndices^ `]`)? `)` `->` $dest `:` type($dest)
+   }];
+   let hasVerifier = 1;
+}
+
 // threadwise_write_all
 def Rock_ThreadwiseWriteAllOp :
     Rock_Op<"threadwise_write_all", [
       DeclareOpInterfaceMethods<RockAcceptingViewOpInterface>,
-      DeclareOpInterfaceMethods<RockWriterOpInterface>]>,
+      DeclareOpInterfaceMethods<RockWriterOpInterface>, AttrSizedOperandSegments,
+      OptionalTypesMatchWith<"validity record is a vector of one boolean per dest entry",
+      "dest", "dynamicValidity", SameShapeVectorOfI1>]>,
     AllElementTypesMatch<["source", "dest"]>,
     Arguments<(ins Arg<MemRefRankOf<SupportedMemoryElems, [1]>,
       "source registers", [MemRead]>:$source,
-      Arg<MemRefOf<NativeMemoryOpTypes>, "detination view", [MemWrite]>:$dest,
+      Arg<MemRefOf<NativeMemoryOpTypes>, "destination view", [MemWrite]>:$dest,
+      Optional<VectorOf<[I1]>>:$dynamicValidity,
       TransformMapArrayAttr:$extraViews,
       Variadic<Index>:$extraIndices,
       Rock_GemmFeaturesAttr:$features,
@@ -1141,6 +1183,11 @@ def Rock_ThreadwiseWriteAllOp :
     The input to extraViews ; (the transforms on %dest) must have the form
     (extraIdx0, ... , extraIdxN, iteration_number).
 
+    If any `dynamicValidities` are passed in, they must have the same shape
+    as the source registers, and the booleans in each of these validities will be
+    ANDed together with the validity implied by the coordinate transformations
+    to determine whether the read is to actually be performed.
+
     Primarily, extraIndices would be used to pass in tid and bid. This would need
     to have a matching view in [extraViews]dest. The extraIndices could be used
     to integrate loop induction vars that is outside of the op.
@@ -1163,8 +1210,20 @@ def Rock_ThreadwiseWriteAllOp :
     ```
   }];
 
+  let builders = [
+    // Alias for the common case where we aren't filling a buffer of validity checks
+    OpBuilder<(ins "Value":$source, "Value":$dest,
+                   "ArrayAttr":$extraViews, "ValueRange":$extraIndices,
+                   "GemmFeatures":$features, "StoreMethod":$storeMethod,
+                   "bool":$forceUnroll, "bool":$useIndexDiffs),
+      [{
+        build($_builder, $_state, TypeRange{}, source, dest, Value{}, extraViews, extraIndices, features, storeMethod, forceUnroll, useIndexDiffs);
+      }]>
+  ];
+
   let assemblyFormat = [{
     `features` `=` $features attr-dict $source  `->` $extraViews `(` $dest `)` (`[` $extraIndices^ `]`)? `by` $storeMethod
+    (`if` ` ` `[` $dynamicValidity^ `]`)?
     `:` type($source) `->` type($dest)
   }];
   let hasVerifier = 1;

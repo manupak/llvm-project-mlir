@@ -2192,6 +2192,45 @@ ParseResult StageOp::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
+//===-----------------------------------------------------===//
+// ThreadwiseFillValidity
+//===-----------------------------------------------------===//
+
+LogicalResult ThreadwiseFillValidityOp::verify() {
+  ArrayAttr views = getViews();
+  size_t extraIndicesRank = getExtraIndices().size();
+  ArrayRef<int64_t> upperShape = cast<TransformMapAttr>(views[0]).getUpperBounds();
+  if(upperShape.size() != extraIndicesRank + 1){
+    return emitError("upper rank should be equal to extraIndicesRank + 1");
+  }
+  int64_t validityLength = getDest().getType().getNumElements();
+  if(upperShape.back() != validityLength){
+    return emitError("The last dim length of views should be equal to validity length");
+  }
+  Attribute memSpaceAttr = getDest().getType().getMemorySpace();
+  auto gpuMemSpaceAttr = dyn_cast_or_null<gpu::AddressSpaceAttr>(memSpaceAttr);
+  if (memSpaceAttr && (!gpuMemSpaceAttr ||
+                       gpuMemSpaceAttr.getValue() != gpu::AddressSpace::Private))
+    return emitOpError("dest memref must live in registers");
+  return success();
+}
+
+//===-----------------------------------------------------===//
+// TileAndPad
+//===-----------------------------------------------------===//
+
+void TileAndPadOp::build(mlir::OpBuilder& b, mlir::OperationState& ods, mlir::Value input, int64_t dim, int64_t tileSize){
+  MemRefType inTy = cast<MemRefType>(input.getType());
+  ArrayRef<int64_t> inShape = inTy.getShape();
+  int64_t prePadDimSize = inShape[dim];
+  int64_t prePadTileSize = math_util::largest_factor_less_than(prePadDimSize, tileSize);
+  int64_t padDimSize = (prePadDimSize / prePadTileSize) * tileSize;
+  SmallVector<int64_t> outShape = llvm::to_vector(inShape);
+  outShape[dim] = padDimSize;
+  BaseMemRefType outTy = inTy.cloneWith(outShape, inTy.getElementType());
+  build(b, ods, outTy, input, b.getIndexAttr(dim), b.getIndexAttr(tileSize));
+}
+
 //===----------------------------------------------------------------------===//
 // TableGen'd op method definitions
 //===----------------------------------------------------------------------===//
